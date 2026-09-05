@@ -42,6 +42,7 @@ export default function WebContainerPreview() {
   const [snapshotAvailable, setSnapshotAvailable] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [copiedUrl, setCopiedUrl] = useState(false);
   // Keep a handle on the running dev server so Stop can kill it without
   // tearing down the whole effect (WebContainer stays alive).
   const devRef = useRef<WebContainerProcess | null>(null);
@@ -222,6 +223,70 @@ export default function WebContainerPreview() {
     };
   }, [mode, refreshKey]);
 
+  // SSO popup relay: the preview iframe is cross-origin to this page, so the
+  // browser blocks window.open called from inside it. When the workspace app
+  // asks us to open the Azure login popup (sso:open), we open it here at the
+  // top level (where window.open is allowed), listen for the relay page to
+  // postMessage the auth code back to window.opener, then forward { code, state }
+  // to the iframe so it can complete the PKCE token exchange. No secrets pass
+  // through us — the PKCE verifier stays in the iframe.
+  useEffect(() => {
+    type OpenRequest = { type: "sso:open"; requestId: string; url: string; relayOrigin: string };
+    type RelayCode = { type: "sso:code"; code: string; state: string };
+    type RelayError = { type: "sso:error"; error: string };
+
+    let popup: Window | null = null;
+    let closedWatcher: number | undefined;
+    let pendingRequestId: string | null = null;
+    let pendingSource: Window | null = null;
+
+    function onMessage(event: MessageEvent) {
+      const data = event.data as OpenRequest | RelayCode | RelayError | null;
+      if (!data || typeof data !== "object") return;
+
+      if (data.type === "sso:open") {
+        // Request from the iframe to open the popup at the top level.
+        pendingRequestId = data.requestId;
+        pendingSource = event.source as Window | null;
+        popup = window.open(data.url, "azure-login", "width=600,height=700");
+        if (!popup) {
+          forward({ error: "Popup blocked — allow popups for this site and try again." });
+          return;
+        }
+        closedWatcher = window.setInterval(() => {
+          if (popup?.closed) {
+            window.clearInterval(closedWatcher);
+            forward({ error: "Sign-in window was closed before completing." });
+          }
+        }, 500);
+      } else if (data.type === "sso:code") {
+        // Relay page posted the auth code to window.opener (us). Forward it to
+        // the iframe that originated the request.
+        forward({ code: data.code, state: data.state });
+      } else if (data.type === "sso:error") {
+        forward({ error: data.error });
+      }
+    }
+
+    function forward(payload: { code?: string; state?: string; error?: string }) {
+      if (closedWatcher) window.clearInterval(closedWatcher);
+      pendingSource?.postMessage(
+        { type: "sso:code-relay", requestId: pendingRequestId, ...payload },
+        "*",
+      );
+      popup?.close();
+      pendingRequestId = null;
+      pendingSource = null;
+    }
+
+    window.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      if (closedWatcher) window.clearInterval(closedWatcher);
+      popup?.close();
+    };
+  }, []);
+
   function chooseMode(nextMode: MountMode) {
     if (nextMode === mode || (nextMode === "snapshot" && !snapshotAvailable)) return;
     if (mounted && !window.confirm("Switching mount mode re-mounts the workspace and restarts the dev server. Installed packages are kept, but unsaved container changes are lost. Continue?")) return;
@@ -283,10 +348,47 @@ export default function WebContainerPreview() {
         >
           {status === "stopped" ? "Start" : "Refresh"}
         </button>
-        {previewUrl && <a href={previewUrl} target="_blank" rel="noopener noreferrer" className="rounded border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 no-underline hover:bg-neutral-100">Open in new tab ↗</a>}
+        {previewUrl && (
+          <button
+            type="button"
+            onClick={() => {
+              navigator.clipboard
+                .writeText(previewUrl)
+                .then(() => {
+                  setCopiedUrl(true);
+                  window.setTimeout(() => setCopiedUrl(false), 1500);
+                })
+                .catch(() => {});
+            }}
+            title="Click to copy the preview URL"
+            className="flex max-w-[16rem] items-center gap-1 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-100"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              className="h-3 w-3 shrink-0"
+              aria-hidden="true"
+            >
+              {copiedUrl ? (
+                <polyline points="20 6 9 17 4 12" />
+              ) : (
+                <>
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                </>
+              )}
+            </svg>
+            <span className="truncate">{previewUrl}</span>
+          </button>
+        )}
       </div>
       <div className="relative min-h-0 flex-1">
-        {previewUrl ? <iframe src={previewUrl} title="WebContainer preview" className="h-full w-full bg-white" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
+        {previewUrl ? <iframe src={previewUrl} title="WebContainer preview" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
           {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-xs text-neutral-500">Check the terminal output below, then confirm the workspace API is running and reload.</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[11px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">Dev server stopped</p><p className="text-xs text-neutral-400">Click Start to run it again — the container and installed packages are still warm.</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" /><p className="text-sm">{statusLabel[status]}</p><p className="text-xs text-neutral-400">Loading the workspace through {mode === "tree" ? "File Tree" : "Snapshot"} mode.</p></>}
         </div>}
       </div>
