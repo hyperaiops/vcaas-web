@@ -9,7 +9,7 @@ type Message = {
   streaming?: boolean;
 };
 
-export default function AgentPanel() {
+export default function AgentPanel({ workspaceId }: { workspaceId: string | null }) {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: 0,
@@ -41,7 +41,7 @@ export default function AgentPanel() {
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, workspaceId }),
       });
 
       if (!res.ok || !res.body) {

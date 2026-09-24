@@ -1,19 +1,24 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
-import { toFileSystemTree, type TreeResponse } from "@/app/lib/webcontainer-tree";
+
+// Monaco is large — only load the code editor when the Code tab is opened.
+const CodeEditor = dynamic(() => import("@/app/components/CodeEditor"), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-full items-center justify-center text-sm text-neutral-500">
+      Loading editor…
+    </div>
+  ),
+});
+
+type View = "preview" | "code";
 
 type Status = "booting" | "loading" | "installing" | "starting" | "ready" | "stopped" | "error";
-type MountMode = "tree" | "snapshot";
-type Source = { status: "ready" | "unavailable" | "pending" | "failed"; href?: string };
-type Manifest = {
-  workspace: { id: string; revision: string };
-  defaultMountSource: MountMode;
-  mountSources: { tree: Source; snapshot: Source };
-};
 
-const WORKSPACE_ID = process.env.NEXT_PUBLIC_WEBCONTAINER_WORKSPACE_ID ?? "workspace";
+const WORKSPACE_ID_FALLBACK = "workspace";
 
 // WebContainer is a strict singleton per page. Booting twice throws
 // "Only a single WebContainer instance can be booted", so keep the instance
@@ -28,21 +33,17 @@ function getWebContainer(): Promise<WebContainer> {
   return bootPromise;
 }
 
-function sourceURL(workspaceId: string, mode: MountMode): string {
-  return `/api/workspaces/${encodeURIComponent(workspaceId)}/${mode}`;
-}
+type Props = { workspaceId: string | null };
 
-export default function WebContainerPreview() {
+export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Props) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<Status>("booting");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [mode, setMode] = useState<MountMode>("snapshot");
-  const [mounted, setMounted] = useState(false);
-  const [snapshotAvailable, setSnapshotAvailable] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [copiedUrl, setCopiedUrl] = useState(false);
+  const [view, setView] = useState<View>("preview");
   // Keep a handle on the running dev server so Stop can kill it without
   // tearing down the whole effect (WebContainer stays alive).
   const devRef = useRef<WebContainerProcess | null>(null);
@@ -51,6 +52,9 @@ export default function WebContainerPreview() {
   const stoppedRef = useRef(false);
 
   useEffect(() => {
+    // Wait until a workspace has been selected before booting/mounting.
+    if (!workspaceIdProp) return;
+    const workspaceId = workspaceIdProp ?? WORKSPACE_ID_FALLBACK;
     let cancelled = false;
     let shell: WebContainerProcess | null = null;
     let dev: WebContainerProcess | null = null;
@@ -63,36 +67,32 @@ export default function WebContainerPreview() {
       if (!cancelled) setLogs((previous) => [...previous, message].slice(-100));
     };
 
-    async function fetchJSON<T>(url: string): Promise<T> {
+    async function fetchSnapshot(url: string): Promise<Response> {
       const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
-      if (!response.ok) throw new Error(`Workspace API request failed (${response.status}).`);
-      return response.json() as Promise<T>;
+      if (response.status === 404) {
+        // No cached snapshot yet — trigger generation, then retry once.
+        const gen = await fetch(url, { method: "POST", signal: controller.signal });
+        if (!gen.ok) {
+          const body = await gen.text();
+          throw new Error(`Failed to generate snapshot (${gen.status}): ${body.slice(0, 300)}`);
+        }
+        return gen;
+      }
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`Failed to load snapshot (${response.status}): ${body.slice(0, 300)}`);
+      }
+      return response;
     }
 
     async function mountWorkspace(wc: WebContainer): Promise<void> {
-      const manifest = await fetchJSON<Manifest>(`/api/workspaces/${encodeURIComponent(WORKSPACE_ID)}`);
+      const url = `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/snapshot`;
+      const response = await fetchSnapshot(url);
       if (cancelled) return;
-      setSnapshotAvailable(manifest.mountSources.snapshot.status === "ready");
-      // Fall back to tree for this mount cycle if snapshot isn't ready, but
-      // DON'T setMode("tree") — changing state here would re-trigger this
-      // effect in a loop and undo the user's button click.
-      const selectedMode = mode === "snapshot" && manifest.mountSources.snapshot.status === "ready" ? mode : "tree";
-      const response = await fetch(sourceURL(manifest.workspace.id, selectedMode), {
-        signal: controller.signal,
-        cache: "no-store",
-      });
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`Failed to load ${selectedMode} mount source (${response.status}): ${body.slice(0, 300)}`);
+      if (response.headers.get("x-webcontainer-snapshot-format") !== "webcontainer-snapshot-v1") {
+        throw new Error("The API returned an unsupported WebContainer snapshot format.");
       }
-      if (selectedMode === "snapshot") {
-        if (response.headers.get("x-webcontainer-snapshot-format") !== "webcontainer-snapshot-v1") {
-          throw new Error("The API returned an unsupported WebContainer snapshot format.");
-        }
-        await wc.mount(new Uint8Array(await response.arrayBuffer()));
-      } else {
-        await wc.mount(toFileSystemTree(await response.json() as TreeResponse));
-      }
+      await wc.mount(new Uint8Array(await response.arrayBuffer()));
     }
 
     async function boot() {
@@ -101,7 +101,6 @@ export default function WebContainerPreview() {
         setStatus("booting");
         setPreviewUrl(null);
         setError(null);
-        setMounted(false);
         setLogs([]);
         const [{ Terminal }, { FitAddon }] = await Promise.all([
           import("@xterm/xterm"),
@@ -127,7 +126,7 @@ export default function WebContainerPreview() {
         xterm.open(terminalRef.current);
         fitAddon.fit();
 
-        // Singleton boot — safe to call on every effect run (mode switch).
+        // Singleton boot — safe to call on every effect run (refresh).
         const container = await getWebContainer();
         if (cancelled) return;
         container.on("error", ({ message }) => {
@@ -163,7 +162,6 @@ export default function WebContainerPreview() {
         setStatus("loading");
         await mountWorkspace(container);
         if (cancelled) return;
-        setMounted(true);
 
         shell = await container.spawn("jsh", { terminal: { cols: xterm.cols, rows: xterm.rows } });
         const shellOutput = new WritableStream({ write(data: string) { xterm.write(data); addLog(data); } });
@@ -221,7 +219,7 @@ export default function WebContainerPreview() {
       shell?.kill();
       terminal?.dispose();
     };
-  }, [mode, refreshKey]);
+  }, [refreshKey, workspaceIdProp]);
 
   // SSO popup relay: the preview iframe is cross-origin to this page, so the
   // browser blocks window.open called from inside it. When the workspace app
@@ -287,12 +285,6 @@ export default function WebContainerPreview() {
     };
   }, []);
 
-  function chooseMode(nextMode: MountMode) {
-    if (nextMode === mode || (nextMode === "snapshot" && !snapshotAvailable)) return;
-    if (mounted && !window.confirm("Switching mount mode re-mounts the workspace and restarts the dev server. Installed packages are kept, but unsaved container changes are lost. Continue?")) return;
-    setMode(nextMode);
-  }
-
   function refresh() {
     if (status !== "ready" && status !== "error" && status !== "stopped") return;
     setRefreshKey((k) => k + 1);
@@ -317,96 +309,120 @@ export default function WebContainerPreview() {
   return (
     <div className="flex h-full flex-col bg-white">
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-neutral-200 px-3">
-        <span className="text-xs font-medium tracking-wide text-neutral-600 uppercase">Preview</span>
-        <span className="flex items-center gap-1.5 text-xs text-neutral-500">
-          <span className={`h-1.5 w-1.5 rounded-full ${status === "ready" ? "bg-emerald-500" : status === "error" ? "bg-red-500" : status === "stopped" ? "bg-neutral-400" : "animate-pulse bg-amber-500"}`} />
-          {statusLabel[status]}
-        </span>
-        <div className="ml-auto flex rounded border border-neutral-300 p-0.5 text-xs">
-          {(["tree", "snapshot"] as const).map((candidate) => (
-            <button key={candidate} type="button" disabled={candidate === "snapshot" && !snapshotAvailable} onClick={() => chooseMode(candidate)} className={`rounded px-2 py-0.5 ${mode === candidate ? "bg-blue-600 text-white" : "text-neutral-600 hover:bg-neutral-100"} disabled:cursor-not-allowed disabled:opacity-40`}>
-              {candidate === "tree" ? "File Tree" : "Snapshot"}
+        {/* Preview / Code tab toggle */}
+        <div className="flex rounded border border-neutral-300 p-0.5 text-xs">
+          {(["preview", "code"] as const).map((candidate) => (
+            <button
+              key={candidate}
+              type="button"
+              onClick={() => setView(candidate)}
+              className={`rounded px-2 py-0.5 ${
+                view === candidate ? "bg-blue-600 text-white" : "text-neutral-600 hover:bg-neutral-100"
+              }`}
+            >
+              {candidate === "preview" ? "Preview" : "Code"}
             </button>
           ))}
         </div>
-        {status === "ready" && (
-          <button
-            type="button"
-            onClick={stop}
-            title="Stop the dev server (WebContainer stays alive)"
-            className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-600 hover:bg-red-50"
-          >
-            Stop
-          </button>
+        {view === "preview" && (
+          <span className="flex items-center gap-1.5 text-xs text-neutral-500">
+            <span className={`h-1.5 w-1.5 rounded-full ${status === "ready" ? "bg-emerald-500" : status === "error" ? "bg-red-500" : status === "stopped" ? "bg-neutral-400" : "animate-pulse bg-amber-500"}`} />
+            {statusLabel[status]}
+          </span>
         )}
-        <button
-          type="button"
-          onClick={refresh}
-          disabled={status !== "ready" && status !== "error" && status !== "stopped"}
-          title="Re-mount the workspace and restart the dev server"
-          className="rounded border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          {status === "stopped" ? "Start" : "Refresh"}
-        </button>
-        {previewUrl && (
-          <button
-            type="button"
-            onClick={() => {
-              navigator.clipboard
-                .writeText(previewUrl)
-                .then(() => {
-                  setCopiedUrl(true);
-                  window.setTimeout(() => setCopiedUrl(false), 1500);
-                })
-                .catch(() => {});
-            }}
-            title="Click to copy the preview URL"
-            className="flex max-w-[16rem] items-center gap-1 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-100"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              className="h-3 w-3 shrink-0"
-              aria-hidden="true"
+        {view === "preview" && (
+          <>
+            <div className="ml-auto" />
+            {status === "ready" && (
+              <button
+                type="button"
+                onClick={stop}
+                title="Stop the dev server (WebContainer stays alive)"
+                className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-600 hover:bg-red-50"
+              >
+                Stop
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={refresh}
+              disabled={status !== "ready" && status !== "error" && status !== "stopped"}
+              title="Re-mount the workspace and restart the dev server"
+              className="rounded border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {copiedUrl ? (
-                <polyline points="20 6 9 17 4 12" />
-              ) : (
-                <>
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                </>
-              )}
-            </svg>
-            <span className="truncate">{previewUrl}</span>
-          </button>
+              {status === "stopped" ? "Start" : "Refresh"}
+            </button>
+            {previewUrl && (
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard
+                    .writeText(previewUrl)
+                    .then(() => {
+                      setCopiedUrl(true);
+                      window.setTimeout(() => setCopiedUrl(false), 1500);
+                    })
+                    .catch(() => {});
+                }}
+                title="Click to copy the preview URL"
+                className="flex max-w-[16rem] items-center gap-1 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-100"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="h-3 w-3 shrink-0"
+                  aria-hidden="true"
+                >
+                  {copiedUrl ? (
+                    <polyline points="20 6 9 17 4 12" />
+                  ) : (
+                    <>
+                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                    </>
+                  )}
+                </svg>
+                <span className="truncate">{previewUrl}</span>
+              </button>
+            )}
+          </>
         )}
       </div>
+      {view === "code" ? (
+        <div className="min-h-0 flex-1">
+          {workspaceIdProp ? <CodeEditor workspaceId={workspaceIdProp} /> : null}
+        </div>
+      ) : (
       <div className="relative min-h-0 flex-1">
         {previewUrl ? <iframe src={previewUrl} title="WebContainer preview" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
-          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-xs text-neutral-500">Check the terminal output below, then confirm the workspace API is running and reload.</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[11px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">Dev server stopped</p><p className="text-xs text-neutral-400">Click Start to run it again — the container and installed packages are still warm.</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" /><p className="text-sm">{statusLabel[status]}</p><p className="text-xs text-neutral-400">Loading the workspace through {mode === "tree" ? "File Tree" : "Snapshot"} mode.</p></>}
+          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-xs text-neutral-500">Check the terminal output below, then confirm the workspace API is running and reload.</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[11px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">Dev server stopped</p><p className="text-xs text-neutral-400">Click Start to run it again — the container and installed packages are still warm.</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" /><p className="text-sm">{statusLabel[status]}</p><p className="text-xs text-neutral-400">Loading the workspace through Snapshot mode.</p></>}
         </div>}
       </div>
+      )}
 
-      {/* Visual divider for terminal — fixed, not draggable */}
-      <div
-        role="separator"
-        aria-orientation="horizontal"
-        className="h-1 shrink-0 bg-neutral-300"
-      />
+      {view === "preview" && (
+        <>
+          {/* Visual divider for terminal — fixed, not draggable */}
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            className="h-1 shrink-0 bg-neutral-300"
+          />
 
-      <div
-        className="flex min-h-0 flex-col border-t border-neutral-300"
-        style={{ height: `${terminalHeight}%` }}
-      >
-        <div className="flex h-9 shrink-0 items-center border-b border-neutral-200 px-3"><span className="text-xs font-medium tracking-wide text-neutral-600 uppercase">Terminal</span></div>
-        <div ref={terminalRef} className="min-h-0 flex-1 bg-white px-2 py-1" />
-      </div>
+          <div
+            className="flex min-h-0 flex-col border-t border-neutral-300"
+            style={{ height: `${terminalHeight}%` }}
+          >
+            <div className="flex h-9 shrink-0 items-center border-b border-neutral-200 px-3"><span className="text-xs font-medium tracking-wide text-neutral-600 uppercase">Terminal</span></div>
+            <div ref={terminalRef} className="min-h-0 flex-1 bg-white px-2 py-1" />
+          </div>
+        </>
+      )}
     </div>
   );
 }

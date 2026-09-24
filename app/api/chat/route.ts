@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
+import { getWorkspace } from "@/app/lib/db";
 
-// The pi CLI runs against the workspace served by the Workspace API, so file
-// edits it makes are picked up on the next WebContainer mount (page reload).
-const WORKSPACE_ROOT =
-  process.env.PI_WORKSPACE_ROOT ??
-  "/Users/yuan-feng.xueubisoft.com/GolandProjects/webcontainer-api/workspace";
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+// The pi CLI runs against a workspace managed by SQLite. The active workspace
+// id comes from the request body; we resolve its on-disk root from the DB.
+// PI_WORKSPACE_ROOT remains as a fallback for environments without a DB.
+const PI_WORKSPACE_ROOT = process.env.PI_WORKSPACE_ROOT;
 const PI_BIN = process.env.PI_BIN ?? "pi";
 
 const SYSTEM_PROMPT = [
@@ -20,7 +23,7 @@ type PiEvent = {
 };
 
 /** Runs `pi -p --mode json` and streams assistant text deltas. */
-function streamPi(prompt: string, abort: AbortSignal): ReadableStream<Uint8Array> {
+function streamPi(prompt: string, abort: AbortSignal, cwd: string): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
 
   return new ReadableStream<Uint8Array>({
@@ -28,7 +31,7 @@ function streamPi(prompt: string, abort: AbortSignal): ReadableStream<Uint8Array
       const child = spawn(
         PI_BIN,
         ["-p", "--mode", "json", "--no-session", "--append-system-prompt", SYSTEM_PROMPT, prompt],
-        { cwd: WORKSPACE_ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+        { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
       );
 
       // Kill the pi process if the client disconnects (e.g. page reload,
@@ -91,9 +94,11 @@ function streamPi(prompt: string, abort: AbortSignal): ReadableStream<Uint8Array
 
 export async function POST(request: Request) {
   let message = "";
+  let workspaceId: string | null = null;
   try {
     const body = await request.json();
     message = typeof body?.message === "string" ? body.message : "";
+    workspaceId = typeof body?.workspaceId === "string" ? body.workspaceId : null;
   } catch {
     message = "";
   }
@@ -105,7 +110,15 @@ export async function POST(request: Request) {
     );
   }
 
-  return new Response(streamPi(message, request.signal), {
+  // Resolve the on-disk root for the selected workspace. Falls back to the
+  // PI_WORKSPACE_ROOT env var when no workspace is selected (or unknown).
+  let cwd = PI_WORKSPACE_ROOT ?? process.cwd();
+  if (workspaceId) {
+    const workspace = getWorkspace(workspaceId);
+    if (workspace) cwd = workspace.rootPath;
+  }
+
+  return new Response(streamPi(message, request.signal, cwd), {
     headers: { "Content-Type": "text/plain; charset=utf-8" },
   });
 }
