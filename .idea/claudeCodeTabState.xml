@@ -7,8 +7,6 @@
           <value>
             <TabSessionState>
               <option name="provider" value="claude" />
-              <option name="sessionId" value="3457e2c8-9a38-42f1-8580-a1e7d2747ff4" />
-              <option name="cwd" value="$PROJECT_DIR$" />
               <option name="model" value="glm-5.2[1m]" />
               <option name="permissionMode" value="bypassPermissions" />
             </TabSessionState>
