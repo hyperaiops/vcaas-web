@@ -48,23 +48,54 @@ on disk under `{WORKSPACE_FILES_ROOT}/{id}/` and are walked at request time.
 - `app/lib/workspace/api-helpers.ts` — `jsonResponse`, `errorResponse`,
   `quoteETag`.
 
+### PI agent (per-workspace PiWorker CR)
+- `app/lib/bridge/k8s.ts` — Kubernetes client for the `PiWorker` CRD
+  (`ubi.pi.dev/v1alpha1`, plural `piworkers`). `ensurePiWorker(id)` first creates
+  a per-CR LiteLLM Secret (`pw-<id>-litellm`, key `api-key`) holding the key from
+  `PI_LITELLM_API_KEY`, then creates the CR (named after the workspace id, in
+  `PI_NAMESPACE`) referencing it, polls until `.status.conditions[Ready]==True`
+  and `.status.endpoint` is populated, reads the auto-generated bearer token
+  from the Secret named in `.status.bearerTokenSecretRef`, and returns
+  `{ endpoint, token }`. `deletePiWorker(id)` deletes the CR and its per-CR
+  LiteLLM Secret; the operator's ownerRef + finalizer garbage-collect the
+  managed Deployment/Service/Ingress/bearer-token Secret. Runs in-cluster or via
+  kubeconfig (`KubeConfig.loadFromDefault`); env-driven (`PI_NAMESPACE`,
+  `PI_LITELLM_API_KEY`, `PI_LITELLM_BASE_URL`, `PI_LITELLM_MODEL`,
+  `PI_INGRESS_*`, `PI_BRIDGE_ALLOWED_ORIGIN`). Server-only.
+- The operator is the **PiWorker** repo
+  (`/Users/yuan-feng.xueubisoft.com/GolandProjects/PiWorker`); each `PiWorker` CR
+  reconciles into a pod running the Go `cmd/bridge` (which runs `pi --mode rpc`)
+  behind an authenticated, per-instance Ingress. The bridge accepts the bearer
+  token via the `Authorization` header **or** a `?token=` query param (added so
+  browser `WebSocket`, which cannot set headers, can authenticate).
+
 ### API routes (all under `app/api/`, `runtime = "nodejs"`, `dynamic = "force-dynamic"`)
 - `GET /api/healthz` — liveness.
 - `GET/POST /api/v1/workspaces` — list / create (scaffolds from `template/`).
 - `GET/DELETE /api/v1/workspaces/[id]` — manifest / delete.
 - `GET /api/v1/workspaces/[id]/tree` — JSON tree (+ ETag / `If-None-Match` → 304).
 - `GET/POST /api/v1/workspaces/[id]/snapshot` — serve cached / generate.
-- `POST /api/chat` — streams the external `pi` CLI (`PI_BIN`) against the
+- `POST /api/v1/workspaces/[id]/agent/start` — ensures a `PiWorker` CR is Ready
+  for the workspace and returns `{ endpoint, token }` so the browser can open
+  the agent's `wss://...<ingress-domain>/v1/rpc` WebSocket.
+- `POST /api/v1/workspaces/[id]/agent/stop` — deletes the workspace's `PiWorker`
+  CR (idempotent); the operator garbage-collects the agent resources.
+- `POST /api/chat` — (legacy) streams the external `pi` CLI (`PI_BIN`) against the
   selected workspace's root (resolved from the request `workspaceId` via the DB;
-  falls back to `PI_WORKSPACE_ROOT`).
+  falls back to `PI_WORKSPACE_ROOT`). Unused since the AgentPanel moved to the
+  long-lived bridge WebSocket.
 
 ### Frontend
 - `app/components/WebContainerPreview.tsx` — boots the singleton WebContainer,
   fetches the manifest, mounts tree or snapshot, runs `pnpm install` + `pnpm dev`
   inside the container, renders an xterm terminal + iframe preview. Takes
   `workspaceId` as a prop. Never SSR (`next/dynamic`, `ssr: false`).
-- `app/components/AgentPanel.tsx` — chat UI; POSTs `{ message, workspaceId }`
-  to `/api/chat` and streams the response.
+- `app/components/AgentPanel.tsx` — chat UI; on mount POSTs to
+  `/api/v1/workspaces/[id]/agent/start` then opens a long-lived WebSocket to the
+  agent's public `/v1/rpc` (returned endpoint, `?token=` auth). One Pi RPC
+  `prompt` command per user message; assistant `text_delta` events stream into
+  the current agent message. Closing the socket on unmount also POSTs
+  `/agent/stop` to delete the `PiWorker` CR.
 - `app/components/WorkspaceCard.tsx` — dashboard card.
 - `app/lib/webcontainer-tree.ts` — `toFileSystemTree`: converts the tree API
   response into `@webcontainer/api`'s `FileSystemTree` for `wc.mount()`.
