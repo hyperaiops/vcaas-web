@@ -16,6 +16,14 @@ const IGNORED_NAMES = new Set([
   "build",
   "out",
   ".DS_Store",
+  // PiWorker agent runtime state. The PiWorker bridge mounts the workspace at
+  // /workspace and runs Pi with --agent-dir=/workspace/.pi/agent so session
+  // state survives pod restarts. It also symlinks image-baked provider
+  // extensions (e.g. litellm) into .pi/agent/extensions/<name>. That state is
+  // agent-internal — it's never part of the user's app, and the extensions
+  // symlink would otherwise trip the builder's symlink check (snapshot 422
+  // WORKSPACE_INVALID). Excluded from the revision/tree/snapshot entirely.
+  ".pi",
 ]);
 
 // Same rule as the Go tree builder: ignore .env and .env.* overrides, but

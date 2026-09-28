@@ -6,7 +6,8 @@
 //
 // Rules preserved exactly from the Go implementation:
 //  - ignored names: .git, node_modules, .next, dist, build, out, .DS_Store,
-//    .env, and .env.* overrides EXCEPT .env.local.
+//    .env, and .env.* overrides EXCEPT .env.local, plus .pi (PiWorker agent
+//    runtime state — see paths.ts).
 //  - reject symlinks and non-regular files.
 //  - enforce MaxDepth / MaxFileBytes / MaxFiles / MaxTotalBytes.
 //  - utf-8 files (no NUL bytes) → encoding "utf-8"; otherwise "base64".

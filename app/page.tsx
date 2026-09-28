@@ -81,7 +81,7 @@ export default function Home() {
         <div className="flex h-5 w-5 items-center justify-center rounded bg-blue-600 text-[10px] font-bold text-white">
           PI
         </div>
-        <span className="text-[13px] font-medium text-neutral-800">PI Agent</span>
+        <span className="text-[13px] font-medium text-neutral-800">Vibe Coding Gallery</span>
         <span className="text-[13px] text-neutral-400">— Workspaces</span>
       </header>
 

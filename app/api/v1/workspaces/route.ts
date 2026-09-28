@@ -51,7 +51,13 @@ const SKIP_NAMES = new Set([
 
 async function copyTemplate(dest: string): Promise<void> {
   const src = templateDir();
-  await fs.mkdir(dest, { recursive: true });
+  // The workspace dir is shared with the PiWorker agent Pod, which runs as a
+  // different uid (10001) and needs to write its session state under .pi/agent.
+  // Create it world-writable so the agent can create that subdir; NFS maps the
+  // mode through unchanged (no_root_squash, rw export).
+  await fs.mkdir(dest, { recursive: true, mode: 0o777 });
+  // mkdir mode is masked by umask; chmod to be sure the bits stick.
+  await fs.chmod(dest, 0o777);
   await fs.cp(src, dest, {
     recursive: true,
     filter: (source) => {

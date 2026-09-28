@@ -38,7 +38,7 @@ const INGRESS_TLS_SECRET = process.env.PI_INGRESS_TLS_SECRET ?? "";
 const ALLOWED_ORIGIN = process.env.PI_BRIDGE_ALLOWED_ORIGIN ?? "";
 
 const READY_POLL_INTERVAL_MS = 1000;
-const READY_TIMEOUT_MS = 120_000; // ingress + pod spin-up can take a while.
+const READY_TIMEOUT_MS = Number(process.env.PI_READY_TIMEOUT_MS ?? "300_000"); // 5 min: ingress + pod spin-up can take a while.
 
 export type AgentHandle = {
   endpoint: string; // wss://pw-<host>.<domain>/v1/rpc
