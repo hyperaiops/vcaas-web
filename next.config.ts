@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  output: "standalone",
   // WebContainer requires cross-origin isolation (SharedArrayBuffer).
   async headers() {
     return [
