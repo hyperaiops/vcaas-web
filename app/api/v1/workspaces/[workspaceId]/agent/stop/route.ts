@@ -5,6 +5,7 @@
 // managed Deployment / Service / Ingress / bearer-token Secret; the per-CR
 // LiteLLM Secret we own is also deleted. Idempotent.
 
+import { requireOwnedWorkspace } from "@/app/lib/auth/access";
 import { closeSession } from "@/app/lib/bridge/session";
 import { deletePiWorker } from "@/app/lib/bridge/k8s";
 import { jsonResponse, errorResponse } from "@/app/lib/workspace/api-helpers";
@@ -16,12 +17,13 @@ type Context = { params: Promise<{ workspaceId: string }> };
 
 export async function POST(_request: Request, { params }: Context) {
   const { workspaceId } = await params;
+  const auth = await requireOwnedWorkspace(workspaceId, _request);
+  if (!auth.ok) return auth.response;
   try {
     closeSession(workspaceId, "user left workspace");
     await deletePiWorker(workspaceId);
     return jsonResponse({ apiVersion: "v1", stopped: workspaceId });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return errorResponse(500, "AGENT_STOP_FAILED", message);
+  } catch {
+    return errorResponse(500, "AGENT_STOP_FAILED", "无法停止工作区智能助手。");
   }
 }

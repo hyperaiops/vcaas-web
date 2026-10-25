@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
+import { authenticatedFetch } from "@/app/lib/auth/client";
 import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
 
 // Monaco is large — only load the code editor when the Code tab is opened.
@@ -9,7 +10,7 @@ const CodeEditor = dynamic(() => import("@/app/components/CodeEditor"), {
   ssr: false,
   loading: () => (
     <div className="flex h-full items-center justify-center text-sm text-neutral-500">
-      Loading editor…
+      正在加载编辑器…
     </div>
   ),
 });
@@ -68,19 +69,17 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     };
 
     async function fetchSnapshot(url: string): Promise<Response> {
-      const response = await fetch(url, { signal: controller.signal, cache: "no-store" });
+      const response = await authenticatedFetch(url, { signal: controller.signal, cache: "no-store" });
       if (response.status === 404) {
         // No cached snapshot yet — trigger generation, then retry once.
-        const gen = await fetch(url, { method: "POST", signal: controller.signal });
+        const gen = await authenticatedFetch(url, { method: "POST", signal: controller.signal });
         if (!gen.ok) {
-          const body = await gen.text();
-          throw new Error(`Failed to generate snapshot (${gen.status}): ${body.slice(0, 300)}`);
+          throw new Error(`生成工作区快照失败（${gen.status}），请稍后重试。`);
         }
         return gen;
       }
       if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`Failed to load snapshot (${response.status}): ${body.slice(0, 300)}`);
+        throw new Error(`加载工作区快照失败（${response.status}），请稍后重试。`);
       }
       return response;
     }
@@ -90,7 +89,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
       const response = await fetchSnapshot(url);
       if (cancelled) return;
       if (response.headers.get("x-webcontainer-snapshot-format") !== "webcontainer-snapshot-v1") {
-        throw new Error("The API returned an unsupported WebContainer snapshot format.");
+        throw new Error("服务器返回的 WebContainer 快照格式不受支持。");
       }
       await wc.mount(new Uint8Array(await response.arrayBuffer()));
     }
@@ -111,8 +110,8 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
 
         const xterm = new Terminal({
           convertEol: true,
-          fontSize: 11,
-          fontFamily: "var(--font-geist-mono), monospace",
+          fontSize: 13,
+          fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim() || "monospace",
           theme: {
             background: "#ffffff",
             foreground: "#000000",
@@ -130,12 +129,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         const container = await getWebContainer();
         if (cancelled) return;
         container.on("error", ({ message }) => {
-          addLog(`WebContainer error: ${message}`);
-          if (!cancelled) { setStatus("error"); setError(`WebContainer error: ${message}`); }
+          addLog(`WebContainer 错误： ${message}`);
+          if (!cancelled) { setStatus("error"); setError("WebContainer 运行异常，请查看终端输出后重试。"); }
         });
         container.on("preview-message", (message) => {
           const detail = "message" in message ? message.message : message.args.map(String).join(" ");
-          addLog(`Preview error: ${detail}`);
+          addLog(`预览错误： ${detail}`);
         });
         container.on("server-ready", (_port, url) => {
           // The iframe must load once the HTTP listener is actually up.
@@ -178,7 +177,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
           env: { LIGHTNINGCSS_FORCE_WASM: "1" },
         });
         install.output.pipeTo(new WritableStream({ write(data: string) { xterm.write(data); addLog(data); } })).catch(ignoreAbort);
-        if ((await install.exit) !== 0) throw new Error("`pnpm install` failed inside the WebContainer.");
+        if ((await install.exit) !== 0) throw new Error("WebContainer 中的 `pnpm install` 执行失败。");
         if (cancelled) return;
 
         setStatus("starting");
@@ -197,13 +196,13 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
           devRef.current = null;
           // A kill from the Stop button is expected — don't report it as an error.
           if (!cancelled && code !== 0 && !wasStopped) {
-            addLog(`Dev server exited with code ${code}.`);
+            addLog(`开发服务器已退出，退出码为 ${code}。`);
             setStatus("error");
-            setError(`The development server exited with code ${code}. Check the terminal output below.`);
+            setError(`开发服务器已退出，退出码为 ${code}。请查看下方终端输出。`);
           }
         });
       } catch (reason) {
-        if (!cancelled) { setStatus("error"); setError(reason instanceof Error ? reason.message : "Failed to start WebContainer."); }
+        if (!cancelled) { console.error("WebContainer startup failed", reason); setStatus("error"); setError("WebContainer 启动失败，请查看终端输出后重试。"); }
       }
     }
 
@@ -248,13 +247,13 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         pendingSource = event.source as Window | null;
         popup = window.open(data.url, "azure-login", "width=600,height=700");
         if (!popup) {
-          forward({ error: "Popup blocked — allow popups for this site and try again." });
+          forward({ error: "弹出窗口被拦截，请允许此网站打开弹出窗口后重试。" });
           return;
         }
         closedWatcher = window.setInterval(() => {
           if (popup?.closed) {
             window.clearInterval(closedWatcher);
-            forward({ error: "Sign-in window was closed before completing." });
+            forward({ error: "登录尚未完成，登录窗口已关闭。" });
           }
         }, 500);
       } else if (data.type === "sso:code") {
@@ -300,7 +299,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     setStatus("stopped");
   }
 
-  const statusLabel: Record<Status, string> = { booting: "Booting…", loading: "Loading workspace…", installing: "Installing…", starting: "Starting server…", ready: "Running", stopped: "Stopped", error: "Error" };
+  const statusLabel: Record<Status, string> = { booting: "正在启动容器…", loading: "正在加载工作区…", installing: "正在安装依赖…", starting: "正在启动服务器…", ready: "运行中", stopped: "已停止", error: "启动失败" };
 
   // Fixed terminal size: small while loading, larger once running (derived,
   // no state/effect needed).
@@ -310,7 +309,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     <div className="flex h-full flex-col bg-white">
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-neutral-200 px-3">
         {/* Preview / Code tab toggle */}
-        <div className="flex rounded border border-neutral-300 p-0.5 text-xs">
+        <div className="flex rounded border border-neutral-300 p-0.5 text-[13px]">
           {(["preview", "code"] as const).map((candidate) => (
             <button
               key={candidate}
@@ -320,12 +319,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
                 view === candidate ? "bg-blue-600 text-white" : "text-neutral-600 hover:bg-neutral-100"
               }`}
             >
-              {candidate === "preview" ? "Preview" : "Code"}
+              {candidate === "preview" ? "预览" : "代码"}
             </button>
           ))}
         </div>
         {view === "preview" && (
-          <span className="flex items-center gap-1.5 text-xs text-neutral-500">
+          <span className="flex items-center gap-1.5 text-[13px] text-neutral-500">
             <span className={`h-1.5 w-1.5 rounded-full ${status === "ready" ? "bg-emerald-500" : status === "error" ? "bg-red-500" : status === "stopped" ? "bg-neutral-400" : "animate-pulse bg-amber-500"}`} />
             {statusLabel[status]}
           </span>
@@ -337,20 +336,20 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
               <button
                 type="button"
                 onClick={stop}
-                title="Stop the dev server (WebContainer stays alive)"
-                className="rounded border border-red-300 px-2 py-0.5 text-xs text-red-600 hover:bg-red-50"
+                title="停止开发服务器（保留 WebContainer）"
+                className="rounded border border-red-300 px-2 py-0.5 text-[13px] text-red-600 hover:bg-red-50"
               >
-                Stop
+                停止服务
               </button>
             )}
             <button
               type="button"
               onClick={refresh}
               disabled={status !== "ready" && status !== "error" && status !== "stopped"}
-              title="Re-mount the workspace and restart the dev server"
-              className="rounded border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
+              title="重新挂载工作区并重启开发服务器"
+              className="rounded border border-neutral-300 px-2 py-0.5 text-[13px] text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {status === "stopped" ? "Start" : "Refresh"}
+              {status === "stopped" ? "启动服务" : "重新启动"}
             </button>
             {previewUrl && (
               <button
@@ -364,8 +363,9 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
                     })
                     .catch(() => {});
                 }}
-                title="Click to copy the preview URL"
-                className="flex max-w-[16rem] items-center gap-1 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-0.5 text-xs text-neutral-500 hover:bg-neutral-100"
+                aria-label={copiedUrl ? "预览链接已复制" : "复制预览链接"}
+                title={copiedUrl ? "已复制预览链接" : "复制预览链接"}
+                className="flex max-w-[16rem] items-center gap-1 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-0.5 text-[13px] text-neutral-500 hover:bg-neutral-100"
               >
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -399,8 +399,8 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         </div>
       ) : (
       <div className="relative min-h-0 flex-1">
-        {previewUrl ? <iframe src={previewUrl} title="WebContainer preview" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
-          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-xs text-neutral-500">Check the terminal output below, then confirm the workspace API is running and reload.</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[11px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">Dev server stopped</p><p className="text-xs text-neutral-400">Click Start to run it again — the container and installed packages are still warm.</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" /><p className="text-sm">{statusLabel[status]}</p><p className="text-xs text-neutral-400">Loading the workspace through Snapshot mode.</p></>}
+        {previewUrl ? <iframe src={previewUrl} title="WebContainer 应用预览" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
+          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-[13px] text-neutral-500">请查看下方终端输出，确认工作区服务正常后重新启动。</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[13px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">开发服务器已停止</p><p className="text-[13px] text-neutral-400">点击“启动服务”即可继续运行，容器和已安装的依赖仍然保留。</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" /><p className="text-sm">{statusLabel[status]}</p><p className="text-[13px] text-neutral-400">正在通过快照加载工作区。</p></>}
         </div>}
       </div>
       )}
@@ -418,7 +418,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
             className="flex min-h-0 flex-col border-t border-neutral-300"
             style={{ height: `${terminalHeight}%` }}
           >
-            <div className="flex h-9 shrink-0 items-center border-b border-neutral-200 px-3"><span className="text-xs font-medium tracking-wide text-neutral-600 uppercase">Terminal</span></div>
+            <div className="flex h-9 shrink-0 items-center border-b border-neutral-200 px-3"><span className="text-[13px] font-medium tracking-wide text-neutral-600 uppercase">终端</span></div>
             <div ref={terminalRef} className="min-h-0 flex-1 bg-white px-2 py-1" />
           </div>
         </>

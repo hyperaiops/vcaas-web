@@ -1,9 +1,9 @@
+import { requireOwnedWorkspace } from "@/app/lib/auth/access";
 import { resolveWorkspaceTree } from "@/app/lib/workspace/resolver";
 import { quoteETag, errorResponse } from "@/app/lib/workspace/api-helpers";
 import {
   findSnapshot,
   publishSnapshot,
-  publishPublicSnapshot,
   generateSnapshot,
   SNAPSHOT_FORMAT,
   SnapshotTooLargeError,
@@ -39,14 +39,14 @@ export async function GET(request: Request, { params }: Context) {
 
   const snapshot = await findSnapshot(tree.revision);
   if (!snapshot) {
-    return errorResponse(404, "SNAPSHOT_NOT_AVAILABLE", "A snapshot is not available for the current workspace.");
+    return errorResponse(404, "SNAPSHOT_NOT_AVAILABLE", "当前工作区暂无可用快照。");
   }
   if (request.headers.get("if-none-match") === quoteETag(snapshot.sha256)) {
-    return new Response(null, { status: 304, headers: { etag: quoteETag(snapshot.sha256) } });
+    return new Response(null, { status: 304, headers: { etag: quoteETag(snapshot.sha256), "cache-control": "private, no-store" } });
   }
   return new Response(new Uint8Array(snapshot.buffer), {
     status: 200,
-    headers: snapshotHeaders(workspace.id, tree.revision, snapshot.sha256, snapshot.size, "private, max-age=0, must-revalidate"),
+    headers: snapshotHeaders(workspace.id, tree.revision, snapshot.sha256, snapshot.size, "private, no-store"),
   });
 }
 
@@ -55,6 +55,8 @@ export async function GET(request: Request, { params }: Context) {
 // API) so a workspace that changed mid-generation is retried up to 3 times.
 export async function POST(request: Request, { params }: Context) {
   const { workspaceId } = await params;
+  const auth = await requireOwnedWorkspace(workspaceId, request);
+  if (!auth.ok) return auth.response;
   try {
     const result = await withGenerationSlot(workspaceId, async () => {
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -67,9 +69,9 @@ export async function POST(request: Request, { params }: Context) {
           contents = await generateSnapshot(tree);
         } catch (error) {
           if (error instanceof SnapshotTooLargeError) {
-            return errorResponse(413, "SNAPSHOT_TOO_LARGE", "The generated snapshot exceeds the maximum size.");
+            return errorResponse(413, "SNAPSHOT_TOO_LARGE", "生成的快照超过大小上限。");
           }
-          return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", `Unable to generate the workspace snapshot: ${error instanceof Error ? error.message : String(error)}`);
+          return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "无法生成工作区快照。");
         }
 
         // Re-build to detect a change during generation; if the revision
@@ -79,21 +81,12 @@ export async function POST(request: Request, { params }: Context) {
         if (current.tree.revision !== tree.revision) continue;
 
         const { sha256 } = await publishSnapshot(tree.revision, contents);
-        // Also publish a workspace-id-keyed copy under public/snapshots/ so the
-        // dev server can serve it as a bare static URL. Best-effort: a failure
-        // here must not break the API response (the revision cache is already
-        // published and the API route still serves the blob).
-        try {
-          await publishPublicSnapshot(workspace.id, contents);
-        } catch {
-          // Ignore — public URL is a dev-only convenience, not required for mount.
-        }
         return new Response(new Uint8Array(contents), {
           status: 200,
           headers: snapshotHeaders(workspace.id, tree.revision, sha256, contents.byteLength, "no-store"),
         });
       }
-      return errorResponse(409, "WORKSPACE_CHANGED_DURING_SNAPSHOT", "The workspace changed repeatedly during snapshot generation.");
+      return errorResponse(409, "WORKSPACE_CHANGED_DURING_SNAPSHOT", "生成快照期间工作区多次发生变更，请重试。");
     });
     return result;
   } catch (error) {
@@ -103,6 +96,6 @@ export async function POST(request: Request, { params }: Context) {
         { status: 409, headers: { "content-type": "application/json", "retry-after": "1" } },
       );
     }
-    return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "Unable to generate the workspace snapshot.");
+    return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "无法生成工作区快照。");
   }
 }

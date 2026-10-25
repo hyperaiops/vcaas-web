@@ -70,7 +70,7 @@ export type AgentConnect = {
  *  In all recovery cases the PiWorker CR is re-requested (recreated if it was
  *  deleted) so a recycled CR's stale endpoint/token never gets reused. */
 export async function ensureAgentSession(workspaceId: string): Promise<AgentConnect> {
-  let sess = sessions.get(workspaceId);
+  const sess = sessions.get(workspaceId);
   // Already open, or mid-(re)connect (including a reconnect scheduled after a
   // drop): join the in-flight connect rather than starting a parallel one that
   // would overwrite the session entry and strand the first ws.

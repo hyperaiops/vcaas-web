@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import { resolveWorkspaceTree } from "@/app/lib/workspace/resolver";
 import { jsonResponse, errorResponse } from "@/app/lib/workspace/api-helpers";
 import { findSnapshot, SNAPSHOT_FORMAT } from "@/app/lib/workspace/snapshot";
-import { getWorkspace, deleteWorkspace } from "@/app/lib/db";
+import { deleteWorkspace } from "@/app/lib/db";
+import { requireOwnedWorkspace } from "@/app/lib/auth/access";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -43,16 +44,15 @@ export async function GET(_request: Request, { params }: Context) {
 // orphaned DB row (re-deletable) rather than orphaned files referencing nothing.
 export async function DELETE(_request: Request, { params }: Context) {
   const { workspaceId } = await params;
-  const workspace = getWorkspace(workspaceId);
-  if (!workspace) {
-    return errorResponse(404, "WORKSPACE_NOT_FOUND", "The requested workspace does not exist.");
-  }
+  const auth = await requireOwnedWorkspace(workspaceId, _request);
+  if (!auth.ok) return auth.response;
+  const { workspace } = auth;
   try {
     await fs.rm(workspace.rootPath, { recursive: true, force: true });
-  } catch (error) {
-    return errorResponse(500, "WORKSPACE_DELETE_FAILED", `Unable to remove workspace files: ${error instanceof Error ? error.message : String(error)}`);
+  } catch {
+    return errorResponse(500, "WORKSPACE_DELETE_FAILED", "无法删除工作区文件。");
   }
-  deleteWorkspace(workspaceId);
+  deleteWorkspace(workspaceId, auth.user.id);
   return jsonResponse({ apiVersion: "v1", deleted: workspaceId });
 }
 

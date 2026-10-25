@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated third-party Monaco assets, copied from node_modules.
+    "public/monaco/**",
   ]),
 ]);
 

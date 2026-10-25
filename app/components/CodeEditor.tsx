@@ -2,56 +2,65 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, loader as monacoLoader } from "@monaco-editor/react";
+import { authenticatedFetch } from "@/app/lib/auth/client";
 import type { TreeNode } from "@/app/lib/workspace/types";
 
-// Self-host Monaco: use the local monaco-editor package bundled with this app
-// instead of loading workers from a CDN. Configured once at module load.
-let monacoConfigured = false;
-async function ensureMonacoConfigured() {
-  if (monacoConfigured) return;
-  try {
-    const monaco = await import("monaco-editor");
-    monacoLoader.config({ monaco });
-
-    // Monaco spins up language web workers (editor.worker, ts.worker, …) via
-    // self.MonacoEnvironment.getWorker. Under Turbopack the default worker
-    // URL resolution fails and throws an ErrorEvent ("[object ErrorEvent]"
-    // unhandledRejection). We don't need the TS language worker — diagnostics
-    // are disabled below — so route every worker label at a no-op worker
-    // created from a blob. It answers the worker protocol pings so Monaco's
-    // WorkerManager settles instead of rejecting.
-    const noopWorkerSrc = [
-      "self.onmessage = (e) => {",
-      "  // Echo back so Monaco's worker manager handshake completes.",
-      "  self.postMessage({ id: e.data && e.data.id, method: 'ack' });",
-      "};",
-    ].join("\n");
-    const noopWorkerUrl = URL.createObjectURL(new Blob([noopWorkerSrc], { type: "application/javascript" }));
-    self.MonacoEnvironment = {
-      ...(self.MonacoEnvironment ?? {}),
-      getWorker: () => new Worker(noopWorkerUrl),
-    };
-
-    // Disable the built-in TS/JS language service diagnostics so the editor
-    // behaves like a plain text editor for validation: syntax highlighting
-    // and bracket matching stay, but "unreachable code" / type-error
-    // squiggles and the marker gutter are suppressed.
-    //
-    // `monaco.languages.typescript` is @deprecated (typed as
-    // `{ deprecated: true }`) — the real defaults live on the top-level
-    // `typescript` export, imported directly here.
-    monaco.typescript.typescriptDefaults.setDiagnosticsOptions({
-      noSemanticValidation: true,
-      noSyntaxValidation: true,
+// The generated AMD assets include the matching official Chinese language pack.
+// Share initialization across mounts; never fall back to an external CDN.
+let monacoPromise: Promise<void> | null = null;
+function ensureMonacoConfigured(): Promise<void> {
+  if (!monacoPromise) {
+    monacoPromise = (async () => {
+      type Monaco = typeof import("monaco-editor");
+      const amd = window as unknown as {
+        require: {
+          config(config: object): void;
+          (dependencies: string[], loaded: (monaco: Monaco) => void, failed: (error: unknown) => void): void;
+        };
+        define(name: string, dependencies: string[], factory: () => object): void;
+      };
+      const config = {
+        paths: { vs: "/monaco/vs" },
+        "vs/nls": { availableLanguages: { "*": "zh-cn" } },
+      };
+      monacoLoader.config(config);
+      let timeoutId: number | undefined;
+      const monaco = await new Promise<Monaco>((resolve, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error("本地编辑器加载超时")), 15000);
+        const loadScript = (src: string) => new Promise<void>((loaded, failed) => {
+          const script = document.createElement("script");
+          script.src = src;
+          script.onload = () => loaded();
+          script.onerror = () => failed(new Error(`无法加载本地编辑器资源：${src}`));
+          document.body.appendChild(script);
+        });
+        void (async () => {
+          await loadScript("/monaco/vs/loader.js");
+          await loadScript("/monaco/vs/nls/lang/zh-cn.js");
+          // Monaco 0.56's official language script installs NLS globals but has
+          // no AMD define. Register its completed side effect so the built-in
+          // NLS plugin can resolve it, without modifying the vendor asset.
+          amd.define("vs/nls/lang/zh-cn", [], () => ({}));
+          amd.require.config(config);
+          amd.require(["vs/editor/editor.main"], resolve, reject);
+        })().catch(reject);
+      }).finally(() => window.clearTimeout(timeoutId));
+      monacoLoader.config({ ...config, monaco });
+      await monacoLoader.init();
+      monaco.typescript.typescriptDefaults.setDiagnosticsOptions({
+        noSemanticValidation: true,
+        noSyntaxValidation: true,
+      });
+      monaco.typescript.javascriptDefaults.setDiagnosticsOptions({
+        noSemanticValidation: true,
+        noSyntaxValidation: true,
+      });
+    })().catch((error: unknown) => {
+      monacoPromise = null;
+      throw error;
     });
-    monaco.typescript.javascriptDefaults.setDiagnosticsOptions({
-      noSemanticValidation: true,
-      noSyntaxValidation: true,
-    });
-  } catch {
-    // Fallback to the CDN loader if the local package fails to load.
   }
-  monacoConfigured = true;
+  return monacoPromise;
 }
 
 type FileEntry = {
@@ -147,7 +156,7 @@ function FileTreeItem({
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
-          className="flex w-full items-center gap-1 rounded px-1.5 py-0.5 text-left text-xs text-neutral-600 hover:bg-neutral-100"
+          className="flex w-full items-center gap-1 rounded px-1.5 py-0.5 text-left text-[13px] text-neutral-600 hover:bg-neutral-100"
           style={{ paddingLeft: depth * 10 + 6 }}
         >
           <span className="text-[9px] text-neutral-400">{open ? "▼" : "▶"}</span>
@@ -164,7 +173,7 @@ function FileTreeItem({
     <button
       type="button"
       onClick={() => onSelect(node.path)}
-      className={`flex w-full items-center gap-1 rounded px-1.5 py-0.5 text-left text-xs ${
+      className={`flex w-full items-center gap-1 rounded px-1.5 py-0.5 text-left text-[13px] ${
         activePath === node.path ? "bg-blue-50 text-blue-700" : "text-neutral-700 hover:bg-neutral-100"
       }`}
       style={{ paddingLeft: depth * 10 + 18 }}
@@ -179,6 +188,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
   const [files, setFiles] = useState<Map<string, FileEntry>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [editorStatus, setEditorStatus] = useState<"loading" | "ready" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   // Live (possibly unsaved) content for the active file, keyed by path.
@@ -187,8 +197,8 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
 
   const refreshTree = useCallback(async () => {
     try {
-      const res = await fetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/tree`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`Failed (${res.status})`);
+      const res = await authenticatedFetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/tree`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`请求失败（${res.status}）`);
       const data = (await res.json()) as { root: TreeNode };
       const flat = new Map<string, FileEntry>();
       flattenTree(data.root, "", flat);
@@ -205,7 +215,8 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
       });
       return flat;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load files.");
+      console.error("File load failed", err);
+      setError("文件加载失败，请稍后重试。");
       return null;
     } finally {
       setLoading(false);
@@ -217,8 +228,19 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
   const defaultChosen = useRef(false);
 
   useEffect(() => {
+    let cancelled = false;
+    void ensureMonacoConfigured().then(
+      () => { if (!cancelled) setEditorStatus("ready"); },
+      (error: unknown) => {
+        console.error("Local Monaco initialization failed", error);
+        if (!cancelled) setEditorStatus("error");
+      },
+    );
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     void (async () => {
-      await ensureMonacoConfigured();
       const flat = await refreshTree();
       if (flat && !defaultChosen.current) {
         defaultChosen.current = true;
@@ -239,14 +261,13 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
   const writeFile = useCallback(
     async (filePath: string, contents: string) => {
       try {
-        const res = await fetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/files/${filePath}`, {
+        const res = await authenticatedFetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/files/${filePath}`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ contents }),
         });
         if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body?.error?.message ?? `Failed (${res.status})`);
+          throw new Error(`请求失败（${res.status}）`);
         }
         // Mark the on-disk contents as the new baseline so the file is no longer dirty.
         setFiles((prev) => {
@@ -264,7 +285,8 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
         setTimeout(() => setSaveState((s) => (s === "saved" ? "idle" : s)), 1500);
       } catch (err) {
         setSaveState("error");
-        setError(err instanceof Error ? err.message : "Save failed.");
+        console.error("File save failed", err);
+        setError("保存失败，请稍后重试。");
       }
     },
     [workspaceId],
@@ -295,7 +317,9 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
 
   const monacoOptions = useMemo(
     () => ({
-      fontSize: 13,
+      fontSize: 14,
+      fontFamily: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "PingFang SC", "Microsoft YaHei", "Noto Sans Mono CJK SC", monospace',
+      ariaLabel: "代码编辑器",
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
       automaticLayout: true,
@@ -305,7 +329,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
     [],
   );
 
-  const saveLabel: Record<SaveState, string> = { idle: "", saving: "Saving…", saved: "Saved", error: "Save error" };
+  const saveLabel: Record<SaveState, string> = { idle: "", saving: "正在保存…", saved: "已保存", error: "保存失败" };
   const saveColor: Record<SaveState, string> = {
     idle: "text-neutral-400",
     saving: "text-amber-500",
@@ -317,33 +341,33 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
     <div className="flex h-full flex-col bg-white">
       {/* Editor toolbar */}
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-neutral-200 px-3">
-        <span className="text-xs font-medium tracking-wide text-neutral-600 uppercase">Code</span>
-        <span className="max-w-[16rem] truncate font-mono text-[11px] text-neutral-500" title={activePath ?? ""}>
-          {activePath ?? "no file selected"}
+        <span className="text-[13px] font-medium tracking-wide text-neutral-600 uppercase">代码</span>
+        <span className="max-w-[16rem] truncate font-mono text-[13px] text-neutral-500" title={activePath ?? ""}>
+          {activePath ?? "未选择文件"}
         </span>
-        {isDirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title="Unsaved changes" />}
-        <span className={`text-[11px] ${saveColor[saveState]}`}>{saveLabel[saveState]}</span>
+        {isDirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title="有未保存的更改" />}
+        <span className={`text-[13px] ${saveColor[saveState]}`}>{saveLabel[saveState]}</span>
         <button
           type="button"
           onClick={() => void refreshTree()}
-          className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-xs text-neutral-600 hover:bg-neutral-100"
-          title="Re-read files from disk"
+          className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-[13px] text-neutral-600 hover:bg-neutral-100"
+          title="重新读取磁盘中的文件"
         >
-          Refresh
+          刷新文件
         </button>
       </div>
 
       {error && (
-        <p className="shrink-0 border-b border-red-200 bg-red-50 px-3 py-1.5 text-xs text-red-600">{error}</p>
+        <p className="shrink-0 border-b border-red-200 bg-red-50 px-3 py-1.5 text-[13px] text-red-600">{error}</p>
       )}
 
       <div className="flex min-h-0 flex-1">
         {/* File tree */}
         <aside className="w-52 shrink-0 overflow-y-auto border-r border-neutral-200 py-2">
           {loading ? (
-            <p className="px-3 py-2 text-xs text-neutral-400">Loading…</p>
+            <p className="px-3 py-2 text-[13px] text-neutral-400">正在加载…</p>
           ) : treeView.length === 0 ? (
-            <p className="px-3 py-2 text-xs text-neutral-400">No files.</p>
+            <p className="px-3 py-2 text-[13px] text-neutral-400">暂无文件。</p>
           ) : (
             treeView.map((node) => (
               <FileTreeItem key={node.path} node={node} depth={0} activePath={activePath} onSelect={setActivePath} />
@@ -353,15 +377,26 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
 
         {/* Monaco editor */}
         <div className="min-w-0 flex-1">
-          {!activeFile ? (
+          {editorStatus === "error" ? (
+            <div role="alert" className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-neutral-600">
+              <p>代码编辑器加载失败，请检查网络连接后重试。</p>
+              {/* The upstream loader retains a rejected initialization promise.
+                  Reloading resets it without relying on private loader state. */}
+              <button type="button" onClick={() => window.location.reload()} className="rounded border border-neutral-300 px-3 py-1.5 hover:bg-neutral-100">
+                重新加载页面并重试
+              </button>
+            </div>
+          ) : editorStatus === "loading" ? (
+            <div className="flex h-full items-center justify-center text-sm text-neutral-400">正在加载编辑器…</div>
+          ) : !activeFile ? (
             <div className="flex h-full items-center justify-center text-sm text-neutral-400">
-              Select a file to edit.
+              选择一个文件开始编辑。
             </div>
           ) : isBinary ? (
             <div className="flex h-full items-center justify-center text-sm text-neutral-400">
               <div className="text-center">
-                <p className="font-medium text-neutral-500">Binary file</p>
-                <p className="mt-1 text-xs">This file is not editable in the code editor.</p>
+                <p className="font-medium text-neutral-500">二进制文件</p>
+                <p className="mt-1 text-[13px]">代码编辑器暂不支持编辑此类文件。</p>
               </div>
             </div>
           ) : (
@@ -371,7 +406,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
               value={activeDraft}
               onChange={handleChange}
               options={monacoOptions}
-              loading={<div className="flex h-full items-center justify-center text-sm text-neutral-400">Loading editor…</div>}
+              loading={<div className="flex h-full items-center justify-center text-sm text-neutral-400">正在加载编辑器…</div>}
             />
           )}
         </div>

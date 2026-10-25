@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { authenticatedFetch } from "@/app/lib/auth/client";
 
 type Message = {
   id: number;
@@ -30,7 +31,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
     {
       id: 0,
       role: "agent",
-      text: "Hi! I'm PI, your coding agent. Describe the app you want and I'll build it live in the WebContainer preview on the right.",
+      text: "你好！我是随心一码 AI 编程助手。告诉我你想做什么应用，我会帮你编写代码，并在右侧 WebContainer 中实时预览。",
     },
   ]);
   const [input, setInput] = useState("");
@@ -62,10 +63,9 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
       setConn("connecting");
       try {
         // Open the server-side agent ws (also ensures the PiWorker CR is Ready).
-        const res = await fetch(`${agentBase(wid)}/start`, { method: "POST" });
+        const res = await authenticatedFetch(`${agentBase(wid)}/start`, { method: "POST" });
         if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body?.error?.message ?? `agent/start failed (${res.status})`);
+          throw new Error(`编程助手启动失败（${res.status}）`);
         }
         if (cancelled) return;
         readyRef.current = true;
@@ -112,7 +112,9 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
         };
         sse.onerror = () => {
           if (cancelled) return;
-          // EventSource auto-reconnects; only flag error if we never connected.
+          // EventSource hides HTTP status codes. Check an authenticated API so
+          // an expired/revoked session navigates to login instead of retrying forever.
+          void authenticatedFetch(`/api/v1/workspaces/${encodeURIComponent(wid)}`, { cache: "no-store" }).catch(() => {});
           if (!readyRef.current) setConn("error");
         };
       } catch (err) {
@@ -124,7 +126,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           {
             id: idRef.current++,
             role: "agent",
-            text: `Could not start the agent: ${err instanceof Error ? err.message : String(err)}. Check the server logs and PI_LITELLM_* env vars.`,
+            text: "无法启动编程助手，请稍后重试；若问题持续，请联系管理员检查服务配置。",
           },
         ]);
       }
@@ -163,20 +165,20 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
     setBusy(true);
 
     try {
-      const res = await fetch(`${agentBase(workspaceId!)}/prompt`, {
+      const res = await authenticatedFetch(`${agentBase(workspaceId!)}/prompt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text }),
       });
       if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        throw new Error(body?.error?.message ?? `prompt failed (${res.status})`);
+        throw new Error(`消息发送失败（${res.status}）`);
       }
     } catch (err) {
+      console.error("Agent prompt failed", err);
       setMessages((prev) =>
         prev.map((m) =>
           m.id === agentMsg.id
-            ? { ...m, streaming: false, text: `Error: ${err instanceof Error ? err.message : String(err)}` }
+            ? { ...m, streaming: false, text: "消息发送失败，请稍后重试。" }
             : m,
         ),
       );
@@ -186,9 +188,9 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
   }
 
   const statusLabel =
-    conn === "open" ? (busy ? "Working" : "Idle") :
-    conn === "connecting" ? "Connecting" :
-    conn === "error" ? "Error" : "Disconnected";
+    conn === "open" ? (busy ? "正在处理" : "等待输入") :
+    conn === "connecting" ? "正在连接" :
+    conn === "error" ? "连接失败" : "已断开连接";
   const dotColor =
     conn === "open" ? (busy ? "bg-amber-500 animate-pulse" : "bg-emerald-500") :
     conn === "connecting" ? "bg-amber-500 animate-pulse" : "bg-neutral-400";
@@ -197,10 +199,10 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
     <div className="flex h-full flex-col bg-white">
       {/* Panel header */}
       <div className="flex h-9 shrink-0 items-center justify-between border-b border-neutral-200 px-3">
-        <span className="text-xs font-medium tracking-wide text-neutral-600 uppercase">
-          Assistant
+        <span className="text-[13px] font-medium tracking-wide text-neutral-600 uppercase">
+          AI 编程助手
         </span>
-        <span className="flex items-center gap-1.5 text-xs text-neutral-500">
+        <span className="flex items-center gap-1.5 text-[13px] text-neutral-500">
           <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
           {statusLabel}
         </span>
@@ -245,13 +247,14 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 void send();
               }
             }}
+            aria-label="发送给 AI 编程助手的消息"
             rows={2}
-            placeholder={conn === "open" ? "Describe what you want to build…" : "Connecting to agent…"}
+            placeholder={conn === "open" ? "描述你想实现的应用或功能…" : "正在连接编程助手…"}
             disabled={conn !== "open"}
             className="flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-neutral-800 outline-none placeholder:text-neutral-400 disabled:cursor-not-allowed disabled:text-neutral-400"
           />
@@ -260,11 +263,11 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
             disabled={busy || !input.trim() || conn !== "open"}
             className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Send
+            发送
           </button>
         </div>
-        <p className="mt-1.5 px-0.5 text-[11px] text-neutral-400">
-          Enter to send · Shift+Enter for a new line
+        <p className="mt-1.5 px-0.5 text-[13px] text-neutral-400">
+          Enter 发送 · Shift+Enter 换行
         </p>
       </form>
     </div>

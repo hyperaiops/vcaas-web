@@ -54,12 +54,12 @@ export async function buildTree(
   try {
     const stat = await fs.stat(absolute);
     if (!stat.isDirectory()) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "Workspace root is not a directory.");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区根路径不是目录。");
     }
-  } catch (error) {
+  } catch {
     throw new WorkspaceTreeError(
       "WORKSPACE_INVALID",
-      `Unable to inspect workspace root: ${error instanceof Error ? error.message : String(error)}`,
+      "无法检查工作区根目录。",
     );
   }
 
@@ -80,14 +80,14 @@ async function walk(
   state: WalkState,
 ): Promise<TreeNode> {
   if (depth > state.limits.maxDepth) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", `Workspace exceeds maximum directory depth of ${state.limits.maxDepth}.`);
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区目录层级超过 ${state.limits.maxDepth} 层的上限。`);
   }
   const dir = relative ? path.join(absoluteRoot, relative) : absoluteRoot;
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch (error) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", `Unable to read workspace directory: ${error instanceof Error ? error.message : String(error)}`);
+  } catch {
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法读取工作区目录。");
   }
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
@@ -96,18 +96,18 @@ async function walk(
     const name = entry.name;
     if (isIgnoredName(name)) continue;
     if (name === "." || name === ".." || /[\\/]\x00/.test(name) || name.includes("\0")) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "Workspace contains an unsafe entry name.");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区包含不安全的文件或目录名称。");
     }
     const childRelative = relative ? `${relative}/${name}` : name;
     const childAbsolute = path.join(absoluteRoot, childRelative);
     let info: Stats;
     try {
       info = await fs.lstat(childAbsolute);
-    } catch (error) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `Unable to inspect workspace entry: ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法检查工作区文件或目录。");
     }
     if (info.isSymbolicLink()) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `Workspace contains an unsupported symbolic link "${childRelative}".`);
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区包含不支持的符号链接“${childRelative}”。`);
     }
     if (info.isDirectory()) {
       state.hash.update(`D\x00${childRelative}\x00`);
@@ -115,24 +115,24 @@ async function walk(
       continue;
     }
     if (!info.isFile()) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `Workspace contains an unsupported file type "${childRelative}".`);
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区包含不支持的文件类型“${childRelative}”。`);
     }
     if (info.size > state.limits.maxFileBytes) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `File "${childRelative}" exceeds maximum file size.`);
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", `文件“${childRelative}”超过单个文件的大小上限。`);
     }
     state.files += 1;
     if (state.files > state.limits.maxFiles) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "Workspace exceeds maximum file count.");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区文件数量超过上限。");
     }
     state.total += info.size;
     if (state.total > state.limits.maxTotalBytes) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "Workspace exceeds maximum total size.");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区总大小超过上限。");
     }
     let contents: Buffer;
     try {
       contents = await fs.readFile(childAbsolute);
-    } catch (error) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `Unable to read workspace file: ${error instanceof Error ? error.message : String(error)}`);
+    } catch {
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法读取工作区文件。");
     }
     state.hash.update(`F\x00${childRelative}\x00${contents.length}\x00`);
     state.hash.update(contents);

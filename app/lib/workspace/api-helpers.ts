@@ -7,7 +7,7 @@ export function quoteETag(value: string): string {
 }
 
 export function jsonResponse(body: unknown, status = 200, headers?: HeadersInit): Response {
-  const h = new Headers({ "content-type": "application/json; charset=utf-8", "cache-control": "private, max-age=0, must-revalidate" });
+  const h = new Headers({ "content-type": "application/json; charset=utf-8", "cache-control": "private, no-store" });
   if (headers) {
     for (const [key, value] of new Headers(headers)) h.set(key, value);
   }

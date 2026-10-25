@@ -50,7 +50,7 @@ export async function findSnapshot(revision: string): Promise<FoundSnapshot | nu
     return { path: artifact, size: data.byteLength, sha256, buffer: data };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw new WorkspaceTreeError("SNAPSHOT_LOOKUP_FAILED", `Unable to inspect the workspace snapshot: ${error instanceof Error ? error.message : String(error)}`);
+    throw new WorkspaceTreeError("SNAPSHOT_LOOKUP_FAILED", "无法检查工作区快照。");
   }
 }
 
@@ -80,36 +80,12 @@ export async function publishSnapshot(revision: string, contents: Buffer): Promi
   }
 }
 
-// Publish a workspace-id-keyed copy under public/snapshots/{id}.snapshot so
-// the dev server serves it as a bare static URL (GET /snapshots/{id}.snapshot),
-// bypassing the API route entirely. One file per workspace, overwritten on
-// every generation.
-//
-// Dev-only: `next dev` reads public/ from disk per request, so runtime writes
-// show up; `next start` (production) only serves public/ files baked at build
-// time, so this copy is unreachable there. The .data/.snapshots/{revision}
-// cache remains the source of truth for the API route.
-export async function publishPublicSnapshot(workspaceId: string, contents: Buffer): Promise<void> {
-  const directory = path.join(process.cwd(), "public", "snapshots");
-  await fs.mkdir(directory, { recursive: true });
-  const artifact = path.join(directory, `${workspaceId}.snapshot`);
-  // Atomic write: temp file in the same dir, then rename.
-  const suffix = `.${process.pid}.${crypto.randomUUID()}.tmp`;
-  const tmpArtifact = `${artifact}${suffix}`;
-  try {
-    await fs.writeFile(tmpArtifact, contents);
-    await fs.rename(tmpArtifact, artifact);
-  } finally {
-    await fs.rm(tmpArtifact, { force: true });
-  }
-}
-
 // Materialise a JSON tree into a real directory on disk so
 // @webcontainer/snapshot can walk it. Ported from materializeTree in
 // build-snapshot.mjs.
 async function materializeTree(root: TreeNode, directory: string): Promise<void> {
   if (!root || root.kind !== "directory" || !root.children) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", "The tree returned an invalid root directory.");
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树的根目录无效。");
   }
   for (const [name, node] of Object.entries(root.children)) {
     assertSafeName(name);
@@ -120,31 +96,31 @@ async function materializeTree(root: TreeNode, directory: string): Promise<void>
       continue;
     }
     if (node.kind !== "file" || typeof node.contents !== "string") {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "The tree returned an invalid file node.");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含无效的文件节点。");
     }
     if (node.encoding === "utf-8") {
       await fs.writeFile(target, node.contents, "utf8");
     } else if (node.encoding === "base64") {
       const data = Buffer.from(node.contents, "base64");
       if (data.toString("base64") !== node.contents) {
-        throw new WorkspaceTreeError("WORKSPACE_INVALID", "The tree returned invalid base64 contents.");
+        throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含无效的 base64 内容。");
       }
       await fs.writeFile(target, data);
     } else {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "The tree returned an unsupported file encoding.");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含不支持的文件编码。");
     }
   }
 }
 
 function assertSafeName(name: string): void {
   if (!name || name === "." || name === ".." || /[\\/\0]/.test(name)) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", "The tree returned an unsafe entry name.");
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含不安全的文件或目录名称。");
   }
 }
 
 export class SnapshotTooLargeError extends Error {
   constructor() {
-    super("Generated snapshot exceeds maximum size.");
+    super("生成的快照超过大小上限。");
     this.name = "SnapshotTooLargeError";
   }
 }

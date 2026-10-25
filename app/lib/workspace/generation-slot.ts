@@ -27,7 +27,7 @@ export async function withGenerationSlot<T>(
 export class GenerationInProgressError extends Error {
   workspaceId: string;
   constructor(workspaceId: string) {
-    super("Another snapshot is being generated.");
+    super("当前正在生成另一个快照，请稍后重试。");
     this.name = "GenerationInProgressError";
     this.workspaceId = workspaceId;
   }

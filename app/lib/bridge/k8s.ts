@@ -78,7 +78,7 @@ type PiWorkerStatus = {
   conditions?: Condition[];
 };
 type PiWorker = {
-  metadata?: { name?: string; namespace?: string };
+  metadata?: { name?: string; namespace?: string; labels?: Record<string, string> };
   status?: PiWorkerStatus;
 };
 
@@ -112,6 +112,7 @@ export async function ensurePiWorker(workspaceId: string): Promise<AgentHandle> 
   const deadline = Date.now() + READY_TIMEOUT_MS;
   for (;;) {
     pw = await safeGet(custom, workspaceId);
+    if (pw) assertManagedPiWorker(pw);
     if (pw && isReady(pw) && pw.status?.endpoint) break;
     if (Date.now() > deadline) {
       throw new K8sClientError(
@@ -135,6 +136,9 @@ export async function ensurePiWorker(workspaceId: string): Promise<AgentHandle> 
 export async function deletePiWorker(workspaceId: string): Promise<void> {
   if (!isValidWorkspaceId(workspaceId)) return;
   const { custom } = apis();
+  const worker = await safeGet(custom, workspaceId);
+  if (!worker) return;
+  assertManagedPiWorker(worker);
   try {
     await custom.deleteNamespacedCustomObject(GROUP, VERSION, NAMESPACE, PLURAL, workspaceId);
   } catch (err) {
@@ -181,6 +185,12 @@ async function safeGet(custom: k8s.CustomObjectsApi, workspaceId: string): Promi
   } catch (err) {
     if (isNotFound(err)) return null;
     throw err;
+  }
+}
+
+export function assertManagedPiWorker(pw: PiWorker): void {
+  if (pw.metadata?.labels?.["app.kubernetes.io/managed-by"] !== "webcontainer") {
+    throw new K8sClientError("BAD_CONFIG", "The PiWorker is not managed by this application.");
   }
 }
 

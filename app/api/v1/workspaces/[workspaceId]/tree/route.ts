@@ -1,5 +1,5 @@
 import { resolveWorkspaceTree } from "@/app/lib/workspace/resolver";
-import { quoteETag, jsonResponse, errorResponse } from "@/app/lib/workspace/api-helpers";
+import { quoteETag, jsonResponse } from "@/app/lib/workspace/api-helpers";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,7 +14,7 @@ export async function GET(request: Request, { params }: Context) {
 
   const etag = quoteETag(tree.revision);
   if (request.headers.get("if-none-match") === etag) {
-    return new Response(null, { status: 304, headers: { etag } });
+    return new Response(null, { status: 304, headers: { etag, "cache-control": "private, no-store" } });
   }
   return jsonResponse(
     { apiVersion: "v1", workspaceId: workspace.id, revision: tree.revision, root: tree.root },

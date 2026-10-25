@@ -3,17 +3,25 @@
 :root {
   --background: #f3f3f3;
   --foreground: #1f1f1f;
+  --font-chinese-ui: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
+  --font-code: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", "PingFang SC", "Microsoft YaHei", monospace;
+  --font-sans: var(--font-chinese-ui);
+  --font-mono: var(--font-code);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-chinese-ui);
+  --font-mono: var(--font-code);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  font-family: var(--font-chinese-ui);
+  line-height: 1.65;
+  font-kerning: normal;
+  line-break: strict;
+  overflow-wrap: break-word;
 }

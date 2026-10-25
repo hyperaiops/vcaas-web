@@ -4,7 +4,8 @@
 // its files can't be represented.
 
 import { buildTree, WorkspaceTreeError, type BuiltTree } from "./builder";
-import { getWorkspace, updateWorkspaceRevision } from "../db";
+import { updateWorkspaceRevision } from "../db";
+import { requireOwnedWorkspace } from "../auth/access";
 import { errorResponse } from "./api-helpers";
 import type { WorkspaceLimits, WorkspaceRow } from "./types";
 
@@ -16,20 +17,19 @@ export async function resolveWorkspaceTree(
   workspaceId: string,
   limits?: WorkspaceLimits,
 ): Promise<ResolveResult> {
-  const workspace = getWorkspace(workspaceId);
-  if (!workspace) {
-    return { ok: false, response: errorResponse(404, "WORKSPACE_NOT_FOUND", "The requested workspace does not exist.") };
-  }
+  const auth = await requireOwnedWorkspace(workspaceId);
+  if (!auth.ok) return auth;
+  const { workspace } = auth;
   try {
     const tree = await buildTree(workspace.rootPath, limits);
     if (workspace.revision !== tree.revision) {
-      updateWorkspaceRevision(workspace.id, tree.revision);
+      updateWorkspaceRevision(workspace.id, tree.revision, auth.user.id);
     }
     return { ok: true, workspace, tree };
   } catch (error) {
     if (error instanceof WorkspaceTreeError) {
       return { ok: false, response: errorResponse(422, error.code, error.message) };
     }
-    return { ok: false, response: errorResponse(500, "WORKSPACE_INVALID", "Unable to inspect the workspace.") };
+    return { ok: false, response: errorResponse(500, "WORKSPACE_INVALID", "无法检查工作区。") };
   }
 }

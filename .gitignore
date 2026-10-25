@@ -47,3 +47,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Locally generated Monaco AMD assets and language packs
+/public/monaco/

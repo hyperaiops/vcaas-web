@@ -1,30 +1,14 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "PI Agent — Web IDE",
-  description:
-    "Chat with the PI agent on the left, build and preview in a WebContainer on the right.",
+  title: "随心一码 — 免费编程，让想法发生",
+  description: "今朝侬 vibe 了伐？和 AI 一起编程，把脑海里的想法变成自己的作品。随心一码，让每个想法都有一个开始。",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-      suppressHydrationWarning
-    >
+    <html lang="zh-CN" className="h-full antialiased" suppressHydrationWarning>
       <body className="flex h-dvh flex-col overflow-hidden" suppressHydrationWarning>
         {children}
       </body>
