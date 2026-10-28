@@ -1,29 +1,23 @@
-// POST /api/v1/workspaces/[workspaceId]/agent/stop
-//
-// Drops the server-side agent WebSocket session for this workspace and deletes
-// its PiWorker CR. The operator's ownerRef + finalizer garbage-collect the
-// managed Deployment / Service / Ingress / bearer-token Secret; the per-CR
-// LiteLLM Secret we own is also deleted. Idempotent.
-
+// Release only this page's lease; the session manager shuts down the last lease.
 import { requireOwnedWorkspace } from "@/app/lib/auth/access";
-import { closeSession } from "@/app/lib/bridge/session";
-import { deletePiWorker } from "@/app/lib/bridge/k8s";
+import { releaseAgentLease } from "@/app/lib/bridge/session";
 import { jsonResponse, errorResponse } from "@/app/lib/workspace/api-helpers";
+import { agentError, parseLease, readAgentBody } from "../lease";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
 type Context = { params: Promise<{ workspaceId: string }> };
 
-export async function POST(_request: Request, { params }: Context) {
+export async function POST(request: Request, { params }: Context) {
   const { workspaceId } = await params;
-  const auth = await requireOwnedWorkspace(workspaceId, _request);
+  const auth = await requireOwnedWorkspace(workspaceId, request);
   if (!auth.ok) return auth.response;
+  const lease = parseLease(await readAgentBody(request));
+  if (!lease) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。");
   try {
-    closeSession(workspaceId, "user left workspace");
-    await deletePiWorker(workspaceId);
+    await releaseAgentLease(workspaceId, lease);
     return jsonResponse({ apiVersion: "v1", stopped: workspaceId });
-  } catch {
-    return errorResponse(500, "AGENT_STOP_FAILED", "无法停止工作区智能助手。");
+  } catch (error) {
+    return agentError(error, 500, "AGENT_STOP_FAILED", "无法停止工作区智能助手。");
   }
 }

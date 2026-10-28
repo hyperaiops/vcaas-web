@@ -24,6 +24,17 @@ type PiEvent = {
 
 type ConnState = "connecting" | "open" | "closed" | "error";
 
+type Activation = {
+  clientId: string;
+  issuedAt: number;
+  workspaceId: string;
+  released: boolean;
+  ready: boolean;
+  streamingId: number | null;
+  controller: AbortController;
+  sse: EventSource | null;
+};
+
 const agentBase = (wid: string) => `/api/v1/workspaces/${encodeURIComponent(wid)}/agent`;
 
 export default function AgentPanel({ workspaceId }: { workspaceId: string | null }) {
@@ -40,14 +51,10 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
   const scrollRef = useRef<HTMLDivElement>(null);
   const idRef = useRef(1);
 
-  // The server holds the WebSocket to the agent (over the ingress port-forward);
-  // the browser reads events over SSE and sends prompts over POST. Browsers
-  // can't do the split TCP-target/SNI trick the server-side ws needs, so the
-  // server proxies. The Pi conversation is stateful across the server session.
-  const sseRef = useRef<EventSource | null>(null);
-  const readyRef = useRef(false);
-  // The id of the agent message currently being streamed, if any.
-  const streamingIdRef = useRef<number | null>(null);
+  // The server holds the authenticated WebSocket to the agent; the browser
+  // reads events over SSE and sends prompts over POST. Each page activation
+  // owns a lease, while the Pi conversation is shared by the workspace session.
+  const activeRef = useRef<Activation | null>(null);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -57,24 +64,56 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
   useEffect(() => {
     if (!workspaceId) return;
     const wid = workspaceId;
-    let cancelled = false;
+    let activation: Activation;
 
-    async function connect() {
+    function release(lease: Activation) {
+      if (lease.released) return;
+      lease.released = true;
+      lease.ready = false;
+      lease.controller.abort();
+      if (lease.sse) {
+        lease.sse.onmessage = null;
+        lease.sse.onerror = null;
+        lease.sse.close();
+      }
+      if (activeRef.current === lease) activeRef.current = null;
+      // Never log response bodies or transport errors: they may contain secrets.
+      try {
+        void fetch(`${agentBase(wid)}/stop`, {
+          method: "POST",
+          keepalive: true,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clientId: lease.clientId, issuedAt: lease.issuedAt }),
+        }).then((res) => {
+          if (!res.ok) console.warn("Agent lease release failed", res.status);
+        }).catch(() => { console.warn("Agent lease release request failed"); });
+      } catch {
+        console.warn("Agent lease release request failed");
+      }
+    }
+
+    async function connect(lease: Activation) {
+      const current = () => !lease.released && activeRef.current === lease;
       setConn("connecting");
       try {
         // Open the server-side agent ws (also ensures the PiWorker CR is Ready).
-        const res = await authenticatedFetch(`${agentBase(wid)}/start`, { method: "POST" });
+        const res = await authenticatedFetch(`${agentBase(wid)}/start`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clientId: lease.clientId, issuedAt: lease.issuedAt }),
+          signal: lease.controller.signal,
+        });
+        if (!current()) return;
         if (!res.ok) {
           throw new Error(`编程助手启动失败（${res.status}）`);
         }
-        if (cancelled) return;
-        readyRef.current = true;
-        setConn("open");
-
         // Subscribe to the agent's SSE event stream.
-        const sse = new EventSource(`${agentBase(wid)}/events`);
-        sseRef.current = sse;
+        const sse = new EventSource(`${agentBase(wid)}/events?clientId=${encodeURIComponent(lease.clientId)}`);
+        lease.sse = sse;
+        lease.ready = true;
+        setConn("open");
         sse.onmessage = (ev) => {
+          if (!current()) return;
           let event: PiEvent;
           try {
             event = JSON.parse(ev.data) as PiEvent;
@@ -87,7 +126,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
             typeof event.assistantMessageEvent.delta === "string"
           ) {
             const delta = event.assistantMessageEvent.delta;
-            const id = streamingIdRef.current;
+            const id = lease.streamingId;
             if (id === null) return;
             setMessages((prev) =>
               prev.map((m) => (m.id === id ? { ...m, text: m.text + delta } : m)),
@@ -100,9 +139,9 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
             // on). Skip retries (willRetry) — those emit another agent_end
             // after the next attempt, and their deltas keep appending. Finalize
             // the in-flight message and release the busy lock only on the last.
-            const id = streamingIdRef.current;
+            const id = lease.streamingId;
             if (id !== null) {
-              streamingIdRef.current = null;
+              lease.streamingId = null;
               setBusy(false);
               setMessages((prev) =>
                 prev.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
@@ -111,14 +150,14 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           }
         };
         sse.onerror = () => {
-          if (cancelled) return;
+          if (!current()) return;
           // EventSource hides HTTP status codes. Check an authenticated API so
           // an expired/revoked session navigates to login instead of retrying forever.
           void authenticatedFetch(`/api/v1/workspaces/${encodeURIComponent(wid)}`, { cache: "no-store" }).catch(() => {});
-          if (!readyRef.current) setConn("error");
+          if (!lease.ready) setConn("error");
         };
       } catch (err) {
-        if (cancelled) return;
+        if (!current()) return;
         console.error("agent connect failed", err);
         setConn("error");
         setMessages((prev) => [
@@ -132,49 +171,58 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
       }
     }
 
-    void connect();
-
+    function activate() {
+      activation = {
+        clientId: crypto.randomUUID(), issuedAt: Date.now(), workspaceId: wid,
+        released: false, ready: false, streamingId: null,
+        controller: new AbortController(), sse: null,
+      };
+      activeRef.current = activation;
+      setBusy(false);
+      setMessages((prev) => prev.map((m) => m.streaming ? { ...m, streaming: false } : m));
+      void connect(activation);
+    }
+    const onPageHide = () => release(activation);
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (!event.persisted) return;
+      release(activation);
+      activate();
+    };
+    activate();
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
     return () => {
-      cancelled = true;
-      readyRef.current = false;
-      const sse = sseRef.current;
-      if (sse) {
-        sse.onmessage = null;
-        sse.onerror = null;
-        try { sse.close(); } catch { /* ignore */ }
-      }
-      sseRef.current = null;
-      // Drop the server-side session + delete the PiWorker CR so the operator
-      // garbage-collects the agent Deployment / Service / Ingress / Secret.
-      try {
-        void fetch(`${agentBase(wid)}/stop`, { method: "POST", keepalive: true });
-      } catch { /* ignore */ }
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      release(activation);
     };
   }, [workspaceId]);
 
   async function send() {
     const text = input.trim();
     if (!text || busy) return;
-    if (!readyRef.current) return;
+    const lease = activeRef.current;
+    if (!lease || lease.released || !lease.ready || lease.workspaceId !== workspaceId) return;
 
     const userMsg: Message = { id: idRef.current++, role: "user", text };
     const agentMsg: Message = { id: idRef.current++, role: "agent", text: "", streaming: true };
-    streamingIdRef.current = agentMsg.id;
+    lease.streamingId = agentMsg.id;
     setMessages((prev) => [...prev, userMsg, agentMsg]);
     setInput("");
     setBusy(true);
 
     try {
-      const res = await authenticatedFetch(`${agentBase(workspaceId!)}/prompt`, {
+      const res = await authenticatedFetch(`${agentBase(lease.workspaceId)}/prompt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ clientId: lease.clientId, message: text }),
       });
       if (!res.ok) {
         throw new Error(`消息发送失败（${res.status}）`);
       }
-    } catch (err) {
-      console.error("Agent prompt failed", err);
+    } catch {
+      if (lease.released || activeRef.current !== lease || lease.streamingId !== agentMsg.id) return;
+      console.error("Agent prompt failed");
       setMessages((prev) =>
         prev.map((m) =>
           m.id === agentMsg.id
@@ -183,7 +231,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
         ),
       );
       setBusy(false);
-      streamingIdRef.current = null;
+      lease.streamingId = null;
     }
   }
 
