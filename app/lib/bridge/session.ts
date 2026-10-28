@@ -1,374 +1,246 @@
-// Per-workspace agent session: holds a long-lived `ws` connection from this
-// Next.js server to the PiWorker bridge's public /v1/rpc endpoint over the
-// ingress-nginx port-forward, and bridges it to the browser over HTTP (POST
-// prompts in, SSE event stream out).
-//
-// Why a server-side ws: the bridge is reachable only through a localhost
-// port-forward of ingress-nginx (kubectl port-forward 8443:443). Browsers can't
-// do the split TCP-target/SNI trick the `ws` + tls.createConnection method
-// needs, so the server owns the WebSocket and proxies for the browser.
-//
-// Session model: one server-side ws per workspace id. Browser POSTs prompt
-// commands here; the server forwards them as Pi JSONL frames. Agent stdout
-// JSONL frames are buffered per workspace and drained by the SSE route. When
-// the last SSE subscriber drops and no prompt is in flight, the ws is closed.
-
+// Single-process workspace lifecycle. Leases are registered before any Kubernetes
+// operation; shutdown fences the generation synchronously, then drains it before delete.
 import "server-only";
 import { randomUUID } from "node:crypto";
 import tls from "node:tls";
 import WebSocket from "ws";
-import { ensurePiWorker } from "@/app/lib/bridge/k8s";
+import { ensurePiWorker, deletePiWorker } from "@/app/lib/bridge/k8s";
 
-// When running OUTSIDE the cluster, the agent's public Ingress host is
-// unreachable by DNS, so the server connects through a `kubectl port-forward`
-// of ingress-nginx (localhost:8443) and splits TCP target (127.0.0.1:8443)
-// from TLS SNI/Host (the agent's real host) via tls.createConnection. Set
-// PI_INGRESS_FORWARD_HOST / PI_INGRESS_FORWARD_PORT to enable that mode.
-// When unset (the in-cluster case), the server connects to the wss:// endpoint
-// directly like a normal client — no SNI trick needed.
+const GRACE_MS = 30_000;
+const FRESH_MS = 300_000;
+const TOMBSTONE_MS = 900_000; // exceeds the full accepted issuedAt window, including skew
+const CAPACITY = 10_000;
 const FORWARD_HOST = process.env.PI_INGRESS_FORWARD_HOST ?? "";
 const FORWARD_PORT = Number(process.env.PI_INGRESS_FORWARD_PORT ?? "0");
-const USE_FORWARD = FORWARD_HOST !== "" && FORWARD_PORT > 0;
-
-// One session per workspace: the ws to the agent + the SSE subscribers draining
-// its frames. Buffering lets a late SSE subscriber catch the current response.
-type Session = {
-  ws: WebSocket | null;
-  connecting: Promise<void> | null;
-  endpoint: string;     // wss://pw-<host>.<domain>/v1/rpc (for SNI)
-  token: string;
-  // Outbound frames (agent → browser), fanned out to all SSE subscribers.
-  outbound: string[];   // buffered frames not yet drained by any SSE client
-  subscribers: Set<(frame: string) => void>;
-  // Tracks an in-flight prompt so we know when the session is safe to idle-close.
-  busy: boolean;
-  idleTimer: NodeJS.Timeout | null;
-};
-
-const sessions = new Map<string, Session>();
-// Per-workspace "establishing" lock: the in-flight ensureAgentSession promise.
-// Without this, two concurrent /agent/start calls (React StrictMode double
-// mount in dev, or a fast remount) both observe no session, both call
-// ensurePiWorker, and both open a ws — the bridge is MaxSessions=1, so the
-// second gets a 409 "agent busy" and the first ws is stranded with its slot
-// never released. The lock makes concurrent callers await the same connect.
-const establishing = new Map<string, Promise<AgentConnect>>();
-const IDLE_TIMEOUT_MS = Number(process.env.PI_AGENT_IDLE_TIMEOUT_MS ?? "600_000"); // 10 min
-
-export type AgentConnect = {
-  endpoint: string;
-  token: string;
-};
-
-/** Ensure the agent ws for a workspace is open; return its endpoint + token.
- *  Handles three cases:
- *   - ws open or mid-(re)connect: join the in-flight connect, return.
- *   - session exists but ws dropped (null) and no reconnect in flight: re-request
- *     the CR on the SAME session object (preserving live SSE subscribers) and
- *     reopen the ws. Never replaces an entry that still has subscribers.
- *   - no session at all: create one fresh.
- *  In all recovery cases the PiWorker CR is re-requested (recreated if it was
- *  deleted) so a recycled CR's stale endpoint/token never gets reused. */
-export async function ensureAgentSession(workspaceId: string): Promise<AgentConnect> {
-  const sess = sessions.get(workspaceId);
-  // Already open, or mid-(re)connect (including a reconnect scheduled after a
-  // drop): join the in-flight connect rather than starting a parallel one that
-  // would overwrite the session entry and strand the first ws.
-  if (sess && (sess.ws?.readyState === WebSocket.OPEN || sess.ws?.readyState === WebSocket.CONNECTING || sess.connecting)) {
-    if (sess.idleTimer) { clearTimeout(sess.idleTimer); sess.idleTimer = null; }
-    if (sess.connecting) await sess.connecting.catch(() => { /* surfaced by caller if still not open */ });
-    return { endpoint: sess.endpoint, token: sess.token };
+const CONNECT_MS = Number(process.env.PI_WS_CONNECT_TIMEOUT_MS ?? "180000");
+export type AgentConnect = { endpoint: string; token: string };
+export type AgentLease = { clientId: string; issuedAt: number };
+export class BridgeLifecycleError extends Error {
+  constructor(public status: number, public code: string, message: string) { super(message); }
+}
+type Lease = { issuedAt: number; released: boolean; expires: number; subscribers: Set<(frame: string) => void>; timer?: ReturnType<typeof setTimeout> };
+type Generation = { controller: AbortController; connecting: Promise<AgentConnect> | null; ws: WebSocket | null; handle: AgentConnect | null; busy: boolean; outbound: string[] };
+type Workspace = { leases: Map<string, Lease>; generation: Generation | null; cleanup: Promise<void> | null; dirty: boolean; fenced: boolean; retry?: ReturnType<typeof setTimeout> };
+const workspaces = new Map<string, Workspace>();
+function error(status: number, code: string, message: string): never { throw new BridgeLifecycleError(status, code, message); }
+function sweep() {
+  const now = Date.now();
+  for (const [id, w] of workspaces) {
+    for (const [key, l] of w.leases) if (l.released && l.expires <= now) w.leases.delete(key);
+    if (!w.fenced && !w.dirty && !w.cleanup && !w.generation && !w.leases.size) workspaces.delete(id);
   }
-  // Another caller is already establishing this session (concurrent
-  // /agent/start). Join it instead of racing a second connect.
-  const inFlight = establishing.get(workspaceId);
-  if (inFlight) return inFlight;
-
-  const establish = (async () => {
-    // Re-read under async boundary: a racing caller may have just set it.
-    let s = sessions.get(workspaceId);
-    if (s && (s.ws?.readyState === WebSocket.OPEN || s.ws?.readyState === WebSocket.CONNECTING || s.connecting)) {
-      if (s.connecting) await s.connecting.catch(() => { /* surfaced below */ });
-      return { endpoint: s.endpoint, token: s.token };
-    }
-    // Re-request the CR (recreate if deleted → fresh endpoint + token). A dropped
-    // ws may mean the CR was recycled, so we never trust the old handle here.
-    const handle = await ensurePiWorker(workspaceId);
-    if (s) {
-      // Recover on the existing entry so SSE subscribers already draining it keep
-      // working once the ws reopens. Close any lingering ws first so the bridge
-      // releases its MaxSessions slot — orphaning it (dropping the reference
-      // without close) would keep the slot held and 409 every later connect.
-      if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null; }
-      if (s.ws && s.ws.readyState !== WebSocket.CLOSED) {
-        try { s.ws.removeAllListeners(); s.ws.close(); } catch { /* ignore */ }
-      }
-      s.ws = null;
-      s.outbound = [];
-      s.endpoint = handle.endpoint;
-      s.token = handle.token;
-    } else {
-      s = {
-        ws: null,
-        connecting: null,
-        endpoint: handle.endpoint,
-        token: handle.token,
-        outbound: [],
-        subscribers: new Set(),
-        busy: false,
-        idleTimer: null,
-      };
-      sessions.set(workspaceId, s);
-    }
-    s.connecting = openWebSocket(workspaceId, s, handle);
-    await s.connecting;
-    return { endpoint: handle.endpoint, token: handle.token };
+}
+function workspace(id: string) {
+  sweep();
+  let w = workspaces.get(id);
+  if (!w) {
+    if (workspaces.size >= CAPACITY) error(503, "LEASE_CAPACITY", "Lifecycle capacity reached; retry later");
+    w = { leases: new Map(), generation: null, cleanup: null, dirty: false, fenced: false };
+    workspaces.set(id, w);
+  }
+  return w;
+}
+function validate(input: AgentLease) {
+  if (!input || typeof input.clientId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.clientId) || !Number.isSafeInteger(input.issuedAt)) error(400, "BAD_LEASE", "Expected UUID clientId and integer issuedAt");
+}
+function fresh(input: AgentLease) {
+  if (Math.abs(Date.now() - input.issuedAt) > FRESH_MS) error(410, "LEASE_EXPIRED", "Lease issuance is outside the freshness window");
+}
+function live(w: Workspace, id: string): Lease {
+  const l = w.leases.get(id);
+  if (!l || l.released || w.fenced) error(410, "LEASE_RELEASED", "Lease is no longer active");
+  return l;
+}
+function current(w: Workspace, g: Generation) { return w.generation === g && !g.controller.signal.aborted && !w.fenced; }
+function check(w: Workspace, g: Generation) { if (!current(w, g)) error(410, "LEASE_RELEASED", "Agent generation was released"); }
+function arm(id: string, w: Workspace, clientId: string, l: Lease) {
+  if (l.timer || l.released || l.subscribers.size) return;
+  l.timer = setTimeout(() => {
+    l.timer = undefined;
+    if (workspaces.get(id) !== w || l.released || l.subscribers.size) return;
+    release(w, l);
+    if (![...w.leases.values()].some(x => !x.released)) void shutdown(id, w).catch(() => {});
+  }, GRACE_MS);
+  l.timer.unref?.();
+}
+function release(w: Workspace, l: Lease) {
+  if (l.released) return;
+  l.released = true; l.expires = Date.now() + TOMBSTONE_MS;
+  if (l.timer) clearTimeout(l.timer);
+  l.timer = undefined; l.subscribers.clear();
+}
+function shutdown(id: string, w: Workspace): Promise<void> {
+  if (w.cleanup) return w.cleanup;
+  if (w.retry) { clearTimeout(w.retry); w.retry = undefined; }
+  const g = w.generation;
+  w.generation = null; w.dirty = true;
+  if (g) { g.controller.abort(); g.busy = false; g.ws?.close(); }
+  const operation = (async () => {
+    await g?.connecting?.catch(() => {});
+    await deletePiWorker(id);
+    w.dirty = false;
   })();
-
-  establishing.set(workspaceId, establish);
+  w.cleanup = operation;
+  void operation.then(() => {
+    if (w.cleanup === operation) w.cleanup = null;
+  }, () => {
+    if (w.cleanup === operation) w.cleanup = null;
+    console.error(`[agent:${id}] cleanup failed; retrying in 5 seconds`);
+    if (!w.retry) {
+      w.retry = setTimeout(() => { w.retry = undefined; void shutdown(id, w).catch(() => {}); }, 5000);
+      w.retry.unref?.();
+    }
+  });
+  return operation;
+}
+export async function ensureAgentSession(id: string, input: AgentLease): Promise<AgentConnect> {
+  validate(input);
+  const w = workspace(id);
+  let l = w.leases.get(input.clientId);
+  if (l?.released || w.fenced) error(410, "LEASE_RELEASED", "Lease was released");
+  if (l && l.issuedAt !== input.issuedAt) error(400, "BAD_LEASE", "Lease issuance cannot change");
+  if (!l) {
+    fresh(input);
+    if (w.dirty && !w.cleanup) error(503, "CLEANUP_PENDING", "Agent cleanup must succeed before starting");
+    if (w.leases.size >= CAPACITY) error(503, "LEASE_CAPACITY", "Lease capacity reached; retry later");
+    l = { issuedAt: input.issuedAt, released: false, expires: 0, subscribers: new Set() };
+    w.leases.set(input.clientId, l);
+  }
+  // Register first so a stop arriving while deletion drains can tombstone this
+  // acquisition. Never publish a new generation across the cleanup boundary.
+  if (w.cleanup) {
+    try { await w.cleanup; }
+    catch {
+      release(w, l);
+      error(503, "CLEANUP_PENDING", "Agent cleanup must succeed before starting");
+    }
+  }
+  live(w, input.clientId);
+  if (w.dirty) { release(w, l); error(503, "CLEANUP_PENDING", "Agent cleanup must succeed before starting"); }
+  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, ws: null, handle: null, busy: false, outbound: [] };
   try {
-    return await establish;
-  } finally {
-    // Only clear if ours is still the registered one (a newer call may have
-    // replaced it after an error/retry cycle).
-    if (establishing.get(workspaceId) === establish) establishing.delete(workspaceId);
+    const handle = await connect(id, w, w.generation);
+    live(w, input.clientId);
+    arm(id, w, input.clientId, l);
+    return handle;
+  } catch (err) {
+    if (!l.released) {
+      release(w, l);
+      if (![...w.leases.values()].some(x => !x.released)) await shutdown(id, w).catch(() => {});
+    }
+    throw err;
   }
 }
-
-/** Send a Pi `prompt` command to the agent; the response streams to SSE subscribers.
- *  Self-healing: if the ws isn't open yet (cold start / mid-(re)connect / dropped
- *  mid-session), this re-ensures the session and waits for the connect to finish
- *  rather than surfacing "not open" to the user. The long-lived session is the
- *  point — prompts should keep working without the browser having to re-POST start. */
-export async function sendPrompt(workspaceId: string, message: string): Promise<void> {
-  let sess = sessions.get(workspaceId);
-  // Still connecting from a recent /agent/start or /events? Wait for that
-  // attempt instead of racing a second one.
-  if (sess?.connecting) {
-    await sess.connecting.catch(() => { /* surfaced below if still not open */ });
-    sess = sessions.get(workspaceId);
+export async function releaseAgentLease(id: string, input: AgentLease): Promise<void> {
+  validate(input);
+  const w = workspace(id);
+  let l = w.leases.get(input.clientId);
+  if (l && l.issuedAt !== input.issuedAt) error(400, "BAD_LEASE", "Lease issuance cannot change");
+  if (!l) {
+    fresh(input);
+    if (w.leases.size >= CAPACITY) error(503, "LEASE_CAPACITY", "Lease capacity reached; retry later");
+    l = { issuedAt: input.issuedAt, released: false, expires: 0, subscribers: new Set() };
+    w.leases.set(input.clientId, l);
   }
-  // No session, or the ws dropped (s.ws === null) after the connect succeeded?
-  // Re-establish transparently — this is the reconnect path for a long-lived
-  // session whose ws died between prompts.
-  if (!sess || !sess.ws || sess.ws.readyState !== WebSocket.OPEN) {
-    await ensureAgentSession(workspaceId).catch((err) => {
-      throw new Error(`Agent session is not open: ${err instanceof Error ? err.message : String(err)}`);
-    });
-    sess = sessions.get(workspaceId);
-  }
-  if (!sess?.ws || sess.ws.readyState !== WebSocket.OPEN) {
-    throw new Error("Agent session is not open. POST /agent/start first.");
-  }
-  if (sess.idleTimer) { clearTimeout(sess.idleTimer); sess.idleTimer = null; }
-  sess.busy = true;
-  const cmd = JSON.stringify({ id: `req-${randomUUID()}`, type: "prompt", message });
-  sess.ws.send(cmd);
+  release(w, l);
+  if (![...w.leases.values()].some(x => !x.released)) await shutdown(id, w);
 }
-
-/** Subscribe to outbound agent frames. Returns an unsubscribe fn. */
-export function subscribe(
-  workspaceId: string,
-  onFrame: (frame: string) => void,
-): () => void {
-  const sess = sessions.get(workspaceId);
-  if (!sess) return () => {};
-  if (sess.idleTimer) { clearTimeout(sess.idleTimer); sess.idleTimer = null; }
-  sess.subscribers.add(onFrame);
-  // Flush any buffered frames to the new subscriber.
-  for (const frame of sess.outbound) onFrame(frame);
-  return () => {
-    sess.subscribers.delete(onFrame);
-    if (sess.subscribers.size === 0) scheduleIdle(workspaceId, sess);
-  };
+export async function forceShutdown(id: string): Promise<void> {
+  const w = workspace(id); w.fenced = true;
+  for (const l of w.leases.values()) release(w, l);
+  await shutdown(id, w);
 }
-
-/** Mark a prompt stream complete (called by the SSE route when the browser
- *  signals it's done, or on session close). */
-export function finishPrompt(workspaceId: string): void {
-  const sess = sessions.get(workspaceId);
-  if (!sess) return;
-  sess.busy = false;
-  if (sess.subscribers.size === 0) scheduleIdle(workspaceId, sess);
+export async function sendPrompt(id: string, clientId: string, message: string): Promise<void> {
+  const w = workspaces.get(id);
+  if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
+  live(w, clientId);
+  const g = w.generation;
+  if (!g) error(410, "LEASE_RELEASED", "Agent was released");
+  await connect(id, w, g);
+  live(w, clientId); check(w, g);
+  g.busy = true;
+  const socket = g.ws!;
+  try { socket.send(JSON.stringify({ id: `req-${randomUUID()}`, type: "prompt", message }), err => { if (err && current(w, g) && g.ws === socket) g.busy = false; }); }
+  catch (err) { g.busy = false; throw err; }
 }
-
-// Open the ws to the bridge /v1/rpc. Outside the cluster this goes through the
-// ingress port-forward with a split TCP-target/SNI connection; inside the
-// cluster it connects to the wss:// endpoint directly.
-//
-// A freshly reconciled PiWorker can report Ready=True a moment before the
-// ingress-nginx backend is routable, so the first ws connect can get a transient
-// 502/503 from nginx. We retry the connect with backoff for up to WS_CONNECT_TIMEOUT_MS
-// so a cold start doesn't surface as a hard error to the browser.
-const WS_CONNECT_TIMEOUT_MS = Number(process.env.PI_WS_CONNECT_TIMEOUT_MS ?? "180_000"); // 3 min
-const WS_CONNECT_BASE_DELAY_MS = 500;
-
-function openWebSocket(workspaceId: string, sess: Session, handle: AgentConnect): Promise<void> {
+export function subscribe(id: string, clientId: string, onFrame: (frame: string) => void): (() => void) | null {
+  const w = workspaces.get(id), l = w?.leases.get(clientId);
+  if (!w || !l || l.released || w.fenced || !w.generation) return null;
+  if (l.timer) clearTimeout(l.timer);
+  l.timer = undefined; l.subscribers.add(onFrame);
+  for (const frame of w.generation.outbound) onFrame(frame);
+  return () => { l.subscribers.delete(onFrame); arm(id, w, clientId, l); };
+}
+function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const url = new URL(handle.endpoint); // wss://pw-<host>.<domain>/v1/rpc
-    const host = url.host;                // pw-<host>.<domain> (SNI + Host)
-    const path = `${url.pathname}?token=${encodeURIComponent(handle.token)}`;
-    const wsUrl = `wss://${host}${path}`;
-
-    const forwardOpts: WebSocket.ClientOptions = USE_FORWARD
-      ? {
-          createConnection: () =>
-            tls.connect({
-              host: FORWARD_HOST,    // TCP target: literal IP, no DNS
-              port: FORWARD_PORT,
-              servername: host,      // TLS SNI: what nginx routes on
-              rejectUnauthorized: false, // port-forward has no valid cert
-            }),
-        }
-      : {}; // in-cluster: connect to wss://host directly, normal TLS + DNS
-
-    const deadline = Date.now() + WS_CONNECT_TIMEOUT_MS;
-    let attempt = 0;
-
-    const tryConnect = () => {
-      const ws = new WebSocket(wsUrl, forwardOpts);
-      sess.ws = ws;
-      // `opened` is true only after a successful handshake. It gates the close
-      // handler's reconnect path so a connect-phase failure (e.g. bridge 409
-      // "agent busy", nginx 503) does NOT also trigger scheduleReconnect — that
-      // would race this same tryConnect's own backoff retry and open a second
-      // ws against the bridge's MaxSessions=1, leaking the slot and cascading
-      // 409s. Connect-phase errors are handled solely by the error handler's
-      // own retry below.
-      let opened = false;
-
-      ws.on("open", () => { opened = true; resolve(); });
-      ws.on("error", (err) => {
-        if (opened) {
-          // An error after open (the ws is being torn down). The close handler
-          // owns the post-open reconnect; don't double-handle here.
-          return;
-        }
-        console.error(`[agent:${workspaceId}] ws connect error (attempt ${attempt + 1}):`, err.message);
-        // Tear down this ws so a retry starts clean.
-        try { ws.removeAllListeners(); ws.close(); } catch { /* ignore */ }
-        if (Date.now() > deadline) {
-          reject(err);
-          return;
-        }
-        // Backoff: 500ms, 1s, 2s, 4s, … capped at 8s. Absorbs the cold-start
-        // window where nginx returns 503, and the bridge's transient 409
-        // "agent busy" while a previous ws is being released.
-        const delay = Math.min(WS_CONNECT_BASE_DELAY_MS * 2 ** attempt, 8000);
-        attempt++;
-        setTimeout(() => { if (sessions.get(workspaceId) === sess) tryConnect(); else reject(new Error("session closed")); }, delay);
-      });
-      ws.on("message", (data) => {
-        const frame = data.toString();
-        // Fan out to SSE subscribers; buffer if none yet.
-        if (sess.subscribers.size > 0) {
-          for (const sub of sess.subscribers) sub(frame);
-        } else {
-          sess.outbound.push(frame);
-        }
-      });
-      ws.on("close", () => {
-        if (!opened) return; // connect-phase close handled by error/retry
-        console.error(`[agent:${workspaceId}] ws closed`);
-        const s = sessions.get(workspaceId);
-        if (!s) return;
-        s.ws = null;
-        s.connecting = null;
-        // Auto-reconnect a long-lived session: if a browser (or any SSE
-        // subscriber) is still attached, the ws dropped mid-use, so re-establish
-        // it right away rather than waiting for the next prompt to notice.
-        // scheduleReconnect is a no-op if the session was already closing on
-        // purpose (closeSession deletes it first). It re-requests the PiWorker
-        // CR (re-creating it if it was deleted) so a stale endpoint/token from
-        // a garbage-collected CR doesn't doom the reconnect.
-        if (s.subscribers.size > 0 || s.busy) scheduleReconnect(workspaceId, s);
-      });
-    };
-
-    tryConnect();
+    const abort = () => { clearTimeout(timer); reject(new BridgeLifecycleError(410, "LEASE_RELEASED", "Generation cancelled")); };
+    const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
   });
 }
-
-function scheduleIdle(workspaceId: string, sess: Session): void {
-  if (sess.busy || sess.subscribers.size > 0 || sess.idleTimer) return;
-  sess.idleTimer = setTimeout(() => {
-    closeSession(workspaceId, "idle timeout");
-  }, IDLE_TIMEOUT_MS);
-}
-
-// Re-establish a dropped long-lived ws while the session is still in use (has
-// SSE subscribers or an in-flight prompt). Idempotent: a reconnect already in
-// flight (sess.connecting) is not replaced. Subscribers stay attached across
-// the outage, so once the ws reopens the stream resumes transparently — the
-// browser never sees "not open". The agent's turn in flight when the drop
-// happened is lost (pi aborts on socket close), but the next prompt works.
-//
-// Unlike a fresh connect, each retry re-requests the PiWorker CR via
-// ensurePiWorker — if the CR was deleted (e.g. its Pod was evicted and the
-// operator garbage-collected it, or an explicit stop raced with the drop),
-// this recreates it and waits for Ready, then opens the ws against a fresh
-// endpoint + token. The cached handle from the original openWebSocket is
-// deliberately discarded: its endpoint/token may point at a now-defunct CR.
-const RECONNECT_BASE_DELAY_MS = 500;
-const RECONNECT_TIMEOUT_MS = Number(process.env.PI_WS_CONNECT_TIMEOUT_MS ?? "180_000"); // 3 min
-
-async function scheduleReconnect(workspaceId: string, sess: Session): Promise<void> {
-  if (sess.connecting) return; // already reconnecting
-  const deadline = Date.now() + RECONNECT_TIMEOUT_MS;
-  let attempt = 0;
-  const tryReconnect = async () => {
-    if (sessions.get(workspaceId) !== sess) return; // session closed on purpose
-    // Re-request the CR (create if missing, wait Ready, read fresh endpoint+token).
-    // This is the key difference from the initial connect: a dropped ws may mean
-    // the CR was recycled, so we can't trust the old handle.
-    let handle: AgentConnect;
-    try {
-      handle = await ensurePiWorker(workspaceId);
-    } catch (err) {
-      const s = sessions.get(workspaceId);
-      if (!s) return; // closed
-      if (Date.now() > deadline) {
-        console.error(`[agent:${workspaceId}] reconnect: CR ensure failed:`, err instanceof Error ? err.message : err);
-        return; // next prompt will retry via sendPrompt's ensureAgentSession
+function connect(id: string, w: Workspace, g: Generation): Promise<AgentConnect> {
+  check(w, g);
+  if (g.connecting) return g.connecting;
+  if (g.ws?.readyState === WebSocket.OPEN && g.handle) return Promise.resolve(g.handle);
+  const task = (async () => {
+    const deadline = Date.now() + CONNECT_MS;
+    let attempt = 0;
+    while (true) {
+      check(w, g);
+      try {
+        const handle = await ensurePiWorker(id, g.controller.signal);
+        check(w, g);
+        await open(id, w, g, handle);
+        check(w, g); g.handle = handle;
+        return handle;
+      } catch (err) {
+        check(w, g);
+        if (Date.now() >= deadline) throw err;
+        await pause(Math.min(500 * 2 ** attempt++, 8000), g.controller.signal);
       }
-      const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, 8000);
-      attempt++;
-      setTimeout(() => void tryReconnect(), delay);
-      return;
     }
-    const s = sessions.get(workspaceId);
-    if (!s || s !== sess) return; // closed / replaced
-    // Refresh endpoint/token in case the CR was recreated with different values.
-    s.endpoint = handle.endpoint;
-    s.token = handle.token;
-    s.connecting = openWebSocket(workspaceId, s, handle);
-    await s.connecting
-      .then(() => {
-        const cur = sessions.get(workspaceId);
-        if (cur) cur.connecting = null;
-      })
-      .catch(() => {
-        const cur = sessions.get(workspaceId);
-        if (!cur) return; // closed
-        cur.connecting = null;
-        if (Date.now() > deadline) {
-          console.error(`[agent:${workspaceId}] reconnect attempts exhausted; will retry on next prompt`);
-          return;
-        }
-        const delay = Math.min(RECONNECT_BASE_DELAY_MS * 2 ** attempt, 8000);
-        attempt++;
-        setTimeout(() => void tryReconnect(), delay);
-      });
-  };
-  void tryReconnect();
+  })();
+  g.connecting = task;
+  void task.then(() => { if (g.connecting === task) g.connecting = null; }, () => { if (g.connecting === task) g.connecting = null; });
+  return task;
 }
-
-/** Close and drop a workspace's agent session. */
-export function closeSession(workspaceId: string, reason = "manual"): void {
-  const sess = sessions.get(workspaceId);
-  if (!sess) return;
-  if (sess.idleTimer) { clearTimeout(sess.idleTimer); sess.idleTimer = null; }
-  try { sess.ws?.close(); } catch { /* ignore */ }
-  sessions.delete(workspaceId);
-  console.error(`[agent:${workspaceId}] session closed (${reason})`);
+function open(id: string, w: Workspace, g: Generation, handle: AgentConnect): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(handle.endpoint); url.searchParams.set("token", handle.token);
+    const options: WebSocket.ClientOptions = FORWARD_HOST && FORWARD_PORT > 0 && url.protocol === "wss:" ? {
+      createConnection: () => tls.connect({ host: FORWARD_HOST, port: FORWARD_PORT, servername: url.hostname, rejectUnauthorized: false }),
+    } : {};
+    const ws = new WebSocket(url.toString(), options); g.ws = ws;
+    let opened = false;
+    const signal = g.controller.signal;
+    const abort = () => { if (g.ws === ws) g.ws = null; clearTimeout(timeout); ws.close(); reject(new BridgeLifecycleError(410, "LEASE_RELEASED", "Generation cancelled")); };
+    signal.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(() => { if (g.ws === ws) g.ws = null; signal.removeEventListener("abort", abort); ws.close(); reject(new Error("Agent WebSocket handshake timed out")); }, CONNECT_MS);
+    const valid = () => current(w, g) && g.ws === ws;
+    ws.on("open", () => {
+      clearTimeout(timeout);
+      if (!valid()) { ws.close(); reject(new BridgeLifecycleError(410, "LEASE_RELEASED", "Generation cancelled")); return; }
+      opened = true; resolve();
+    });
+    ws.on("message", data => {
+      if (!valid()) return;
+      const frame = data.toString();
+      try { const event = JSON.parse(frame); if (event.type === "agent_end" && !event.willRetry) g.busy = false; } catch { /* non-JSON bridge diagnostics */ }
+      const subscribers = [...w.leases.values()].filter(l => !l.released).flatMap(l => [...l.subscribers]);
+      if (subscribers.length) for (const fn of subscribers) fn(frame);
+      else { g.outbound.push(frame); if (g.outbound.length > 1000) g.outbound.shift(); }
+    });
+    ws.on("error", err => { if (!opened) { if (g.ws === ws) g.ws = null; clearTimeout(timeout); signal.removeEventListener("abort", abort); ws.close(); reject(err); } else if (valid()) g.busy = false; });
+    ws.on("close", () => {
+      clearTimeout(timeout); signal.removeEventListener("abort", abort);
+      if (!opened) { reject(new Error("Agent WebSocket closed before handshake")); return; }
+      if (!valid()) return;
+      g.ws = null; g.busy = false;
+      if ([...w.leases.values()].some(l => !l.released && l.subscribers.size)) {
+        // A microtask lets the previous connection's single-flight settle first.
+        void Promise.resolve().then(() => { if (current(w, g)) return connect(id, w, g); }).catch(() => {});
+      }
+    });
+  });
 }

@@ -18,6 +18,8 @@ function ensureMonacoConfigured(): Promise<void> {
           (dependencies: string[], loaded: (monaco: Monaco) => void, failed: (error: unknown) => void): void;
         };
         define(name: string, dependencies: string[], factory: () => object): void;
+        _VSCODE_NLS_LANGUAGE?: string;
+        _VSCODE_NLS_MESSAGES?: unknown;
       };
       const config = {
         paths: { vs: "/monaco/vs" },
@@ -37,9 +39,13 @@ function ensureMonacoConfigured(): Promise<void> {
         void (async () => {
           await loadScript("/monaco/vs/loader.js");
           await loadScript("/monaco/vs/nls/lang/zh-cn.js");
-          // Monaco 0.56's official language script installs NLS globals but has
-          // no AMD define. Register its completed side effect so the built-in
-          // NLS plugin can resolve it, without modifying the vendor asset.
+          if (amd._VSCODE_NLS_LANGUAGE !== "zh-cn" || !Array.isArray(amd._VSCODE_NLS_MESSAGES) || amd._VSCODE_NLS_MESSAGES.length === 0) {
+            throw new Error("本地编辑器中文语言包未正确加载");
+          }
+          // Monaco 0.56's language script installs globals but has no AMD define.
+          // Its NLS plugin waits on require(["vs/nls/lang/zh-cn"]), so HTTP 200
+          // alone leaves editor.main pending forever. Register only after the
+          // language globals are ready, without modifying the official asset.
           amd.define("vs/nls/lang/zh-cn", [], () => ({}));
           amd.require.config(config);
           amd.require(["vs/editor/editor.main"], resolve, reject);

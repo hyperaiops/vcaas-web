@@ -4,6 +4,7 @@ import { jsonResponse, errorResponse } from "@/app/lib/workspace/api-helpers";
 import { findSnapshot, SNAPSHOT_FORMAT } from "@/app/lib/workspace/snapshot";
 import { deleteWorkspace } from "@/app/lib/db";
 import { requireOwnedWorkspace } from "@/app/lib/auth/access";
+import { forceShutdown } from "@/app/lib/bridge/session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -47,6 +48,11 @@ export async function DELETE(_request: Request, { params }: Context) {
   const auth = await requireOwnedWorkspace(workspaceId, _request);
   if (!auth.ok) return auth.response;
   const { workspace } = auth;
+  try {
+    await forceShutdown(workspaceId);
+  } catch {
+    return errorResponse(503, "WORKSPACE_AGENT_SHUTDOWN_FAILED", "无法停止工作区智能助手，请稍后重试删除。");
+  }
   try {
     await fs.rm(workspace.rootPath, { recursive: true, force: true });
   } catch {

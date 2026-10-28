@@ -4,7 +4,8 @@
 // named after the workspace id. Entering a workspace creates/ensures the CR;
 // the PiWorker operator reconciles it into a Deployment + Service + Ingress +
 // auto-generated bearer-token Secret and writes the public `wss://.../v1/rpc`
-// endpoint into `.status.endpoint`. Leaving deletes the CR; the operator's
+// endpoint into `.status.endpoint`. Service mode connects to `.status.serviceName`
+// instead, bypassing Ingress for RPC traffic. Leaving deletes the CR; the operator's
 // ownerRef + finalizer garbage-collects the child resources (including the
 // LiteLLM key Secret, which the controller now owns and creates from
 // `spec.litellm.apiKey`).
@@ -38,10 +39,10 @@ const INGRESS_TLS_SECRET = process.env.PI_INGRESS_TLS_SECRET ?? "";
 const ALLOWED_ORIGIN = process.env.PI_BRIDGE_ALLOWED_ORIGIN ?? "";
 
 const READY_POLL_INTERVAL_MS = 1000;
-const READY_TIMEOUT_MS = Number(process.env.PI_READY_TIMEOUT_MS ?? "300_000"); // 5 min: ingress + pod spin-up can take a while.
+const READY_TIMEOUT_MS = Number(process.env.PI_READY_TIMEOUT_MS ?? "300000"); // 5 min: ingress + pod spin-up can take a while.
 
 export type AgentHandle = {
-  endpoint: string; // wss://pw-<host>.<domain>/v1/rpc
+  endpoint: string; // selected ws:// Service or public wss:// endpoint
   token: string; // bearer token for the bridge /v1/rpc
 };
 
@@ -73,17 +74,19 @@ function apis(): { custom: k8s.CustomObjectsApi; core: k8s.CoreV1Api } {
 type Condition = { type: string; status: string };
 type PiWorkerStatus = {
   endpoint?: string;
+  serviceName?: string;
   host?: string;
   bearerTokenSecretRef?: { name: string; key: string };
   conditions?: Condition[];
 };
 type PiWorker = {
-  metadata?: { name?: string; namespace?: string; labels?: Record<string, string> };
+  metadata?: { name?: string; namespace?: string; labels?: Record<string, string>; deletionTimestamp?: string };
   status?: PiWorkerStatus;
 };
 
 /** Ensure a Ready PiWorker exists for the workspace; return its endpoint + token. */
-export async function ensurePiWorker(workspaceId: string): Promise<AgentHandle> {
+export async function ensurePiWorker(workspaceId: string, signal?: AbortSignal): Promise<AgentHandle> {
+  signal?.throwIfAborted();
   if (!isValidWorkspaceId(workspaceId)) {
     throw new K8sClientError("BAD_CONFIG", `Invalid workspace id: ${workspaceId}`);
   }
@@ -98,29 +101,60 @@ export async function ensurePiWorker(workspaceId: string): Promise<AgentHandle> 
     );
   }
 
+  const mode = process.env.PI_CONNECTION_MODE ?? "endpoint";
+  if (mode !== "endpoint" && mode !== "service") {
+    throw new K8sClientError("BAD_CONFIG", "PI_CONNECTION_MODE must be endpoint or service.");
+  }
+  if (mode === "service") assertDnsLabel(NAMESPACE, "PI_NAMESPACE");
+
   const { custom, core } = apis();
 
   // Create the CR if absent (AlreadyExists is fine — a remount raced). The
   // LiteLLM key is passed inline in spec.litellm.apiKey; the operator creates
   // and owns the projection Secret, so no separate Secret is needed here.
   let pw: PiWorker | null = await safeGet(custom, workspaceId);
+  signal?.throwIfAborted();
+  if (pw) assertManagedPiWorker(pw);
+  if (pw?.metadata?.deletionTimestamp) {
+    await waitForAbsence(custom, workspaceId, signal);
+    pw = null;
+  }
   if (!pw) {
+    signal?.throwIfAborted();
+    // Do not race an issued write against cancellation. The caller can await this
+    // promise before cleanup, ensuring a late create cannot outlive deletion.
     await createPiWorker(custom, workspaceId);
+    signal?.throwIfAborted();
   }
 
-  // Poll until Ready and endpoint populated.
+  // Service mode needs no public endpoint; both modes wait for the token ref.
   const deadline = Date.now() + READY_TIMEOUT_MS;
+  let endpoint: string | undefined;
   for (;;) {
+    signal?.throwIfAborted();
     pw = await safeGet(custom, workspaceId);
+    signal?.throwIfAborted();
     if (pw) assertManagedPiWorker(pw);
-    if (pw && isReady(pw) && pw.status?.endpoint) break;
+    if (pw?.metadata?.deletionTimestamp) {
+      await waitForAbsence(custom, workspaceId, signal);
+      signal?.throwIfAborted();
+      await createPiWorker(custom, workspaceId);
+      signal?.throwIfAborted();
+      continue;
+    }
+    const serviceName = pw?.status?.serviceName;
+    if (mode === "service" && serviceName) assertDnsLabel(serviceName, "PiWorker serviceName");
+    endpoint = mode === "service"
+      ? serviceName ? `ws://${serviceName}.${NAMESPACE}.svc:8080/v1/rpc` : undefined
+      : pw?.status?.endpoint;
+    if (pw && isReady(pw) && endpoint && pw.status?.bearerTokenSecretRef?.name) break;
     if (Date.now() > deadline) {
       throw new K8sClientError(
         "RECONCILE_TIMEOUT",
         `PiWorker ${workspaceId} did not become Ready within ${READY_TIMEOUT_MS}ms`,
       );
     }
-    await sleep(READY_POLL_INTERVAL_MS);
+    await sleep(READY_POLL_INTERVAL_MS, signal);
   }
 
   const ref = pw.status?.bearerTokenSecretRef;
@@ -128,7 +162,8 @@ export async function ensurePiWorker(workspaceId: string): Promise<AgentHandle> 
     throw new K8sClientError("RECONCILE_TIMEOUT", `PiWorker ${workspaceId} has no bearerTokenSecretRef yet`);
   }
   const token = await readSecret(core, ref.name, ref.key || "token");
-  return { endpoint: pw.status!.endpoint!, token };
+  signal?.throwIfAborted();
+  return { endpoint: endpoint!, token };
 }
 
 /** Delete the workspace's PiWorker (idempotent). The operator garbage-collects
@@ -143,6 +178,22 @@ export async function deletePiWorker(workspaceId: string): Promise<void> {
     await custom.deleteNamespacedCustomObject(GROUP, VERSION, NAMESPACE, PLURAL, workspaceId);
   } catch (err) {
     if (!isNotFound(err)) throw err; // already gone is fine
+  }
+  await waitForAbsence(custom, workspaceId);
+}
+
+async function waitForAbsence(custom: k8s.CustomObjectsApi, workspaceId: string, signal?: AbortSignal): Promise<void> {
+  const deadline = Date.now() + READY_TIMEOUT_MS;
+  for (;;) {
+    signal?.throwIfAborted();
+    const worker = await safeGet(custom, workspaceId);
+    signal?.throwIfAborted();
+    if (!worker) return;
+    assertManagedPiWorker(worker);
+    if (Date.now() > deadline) {
+      throw new K8sClientError("RECONCILE_TIMEOUT", `PiWorker ${workspaceId} was not deleted within ${READY_TIMEOUT_MS}ms`);
+    }
+    await sleep(READY_POLL_INTERVAL_MS, signal);
   }
 }
 
@@ -194,6 +245,12 @@ export function assertManagedPiWorker(pw: PiWorker): void {
   }
 }
 
+function assertDnsLabel(value: string, field: string): void {
+  if (value.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value)) {
+    throw new K8sClientError("BAD_CONFIG", `${field} must be a DNS label.`);
+  }
+}
+
 function isReady(pw: PiWorker): boolean {
   const conds = pw.status?.conditions ?? [];
   return conds.some((c) => c.type === "Ready" && c.status === "True");
@@ -223,6 +280,18 @@ function hasCode(err: unknown, status: number): boolean {
   return e.statusCode === status || e.response?.statusCode === status || e.code === status;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

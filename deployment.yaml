@@ -82,7 +82,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: webcontainer
-          image: ccr.ccs.tencentyun.com/vcaas/platform:latest
+          image: ccr.ccs.tencentyun.com/vcaas/platform:agent-cleanup-20261025-232243
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
@@ -99,8 +99,11 @@ spec:
               value: "0.0.0.0"
             - name: PORT
               value: "3000"
+            # Local port-forward debugging only. Disable this flag and use HTTPS for public access.
+            - name: AUTH_ALLOW_HTTP_LOCALHOST
+              value: "true"
             - name: AUTH_ORIGIN
-              value: https://console.vibe-coding.host
+              value: http://localhost:3000
             - name: AUTH_ISSUER
               value: https://vibe-coding-host.authing.cn/oidc
             - name: AUTH_CLIENT_ID
@@ -127,11 +130,14 @@ spec:
               value: /app/.data/snapshots
             - name: TEMPLATE_DIR
               value: /app/template
-            # Consumed after the corresponding application changes are implemented.
+            # Reserved for the separate PVC/subPath integration.
             - name: PI_WORKSPACE_PVC_NAME
               value: my-agent-workspace
+            # Server-to-agent RPC uses the internal ClusterIP Service, not Ingress.
             - name: PI_CONNECTION_MODE
               value: service
+            - name: PI_LITELLM_MODEL
+              value: glm-5.3-flash
             - name: PI_READY_TIMEOUT_MS
               value: "300000"
             - name: PI_WS_CONNECT_TIMEOUT_MS
