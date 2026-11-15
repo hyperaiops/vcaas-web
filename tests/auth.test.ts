@@ -22,6 +22,7 @@ import * as files from "../app/api/v1/workspaces/[workspaceId]/files/[...path]/r
 import * as start from "../app/api/v1/workspaces/[workspaceId]/agent/start/route";
 import * as stop from "../app/api/v1/workspaces/[workspaceId]/agent/stop/route";
 import * as prompt from "../app/api/v1/workspaces/[workspaceId]/agent/prompt/route";
+import * as cancel from "../app/api/v1/workspaces/[workspaceId]/agent/cancel/route";
 import * as events from "../app/api/v1/workspaces/[workspaceId]/agent/events/route";
 import * as legacy from "../app/api/chat/route";
 import * as callback from "../app/auth/callback/route";
@@ -38,6 +39,8 @@ process.env.AUTH_ISSUER = "https://identity.test/oidc";
 process.env.AUTH_CLIENT_ID = "test-client";
 process.env.AUTH_CLIENT_SECRET = "test-only-not-a-real-secret";
 process.env.AUTH_SESSION_KEY = "12".repeat(32);
+// Agent routes require an explicit runtime mode; route tests never connect to a cluster.
+process.env.PI_RUNTIME_MODE = "prod";
 mkdirSync(process.env.TEMPLATE_DIR);
 writeFileSync(path.join(process.env.TEMPLATE_DIR, "index.txt"), "template");
 const old = new Database(process.env.WORKSPACE_DB_PATH);
@@ -112,7 +115,7 @@ test("all workspace routes deny unauthenticated and other-user requests before s
     () => tree.GET(request(), params), () => snapshot.GET(request(), params), () => snapshot.POST(request("POST"), params),
     () => files.PUT(request("PUT", { contents: "attacker" }), { params: Promise.resolve({ workspaceId: "project-a", path: ["index.txt"] }) }),
     () => start.POST(request("POST"), params), () => stop.POST(request("POST"), params),
-    () => prompt.POST(request("POST", { message: "attack" }), params), () => events.GET(request(), params),
+    () => prompt.POST(request("POST", { message: "attack" }), params), () => cancel.POST(request("POST"), params), () => events.GET(request(), params),
     () => legacy.POST(request("POST", { workspaceId: "project-a", message: "attack" })),
   ];
   for (const route of routes) {
@@ -135,11 +138,13 @@ test("agent lease routes validate bodies only after authentication and ownership
     }
   }
   assert.equal((await context(a.token, () => prompt.POST(request("POST", { message: "hello" }), params))).status, 400);
-  const emptyPrompt = await context(a.token, () => prompt.POST(request("POST", { clientId, message: "  " }), params));
+  const turnId = "0d9a8059-0a3f-45c6-80cb-e1f20d282dd3";
+  assert.equal((await context(a.token, () => cancel.POST(request("POST", { clientId }), params))).status, 400);
+  const emptyPrompt = await context(a.token, () => prompt.POST(request("POST", { clientId, turnId, message: "  " }), params));
   assert.equal(emptyPrompt.status, 400);
   assert.equal((await emptyPrompt.json()).error.code, "EMPTY_PROMPT");
-  for (const route of [start.POST, stop.POST, prompt.POST]) {
-    assert.equal((await context(a.token, () => route(request("POST", { clientId, issuedAt: Date.now(), message: "hello" }, "https://evil.test"), params))).status, 403);
+  for (const route of [start.POST, stop.POST, prompt.POST, cancel.POST]) {
+    assert.equal((await context(a.token, () => route(request("POST", { clientId, turnId, issuedAt: Date.now(), message: "hello" }, "https://evil.test"), params))).status, 403);
   }
 });
 
@@ -163,8 +168,10 @@ test("released page routes cannot restart, prompt, or reconnect and stop stays i
   const restarted = await context(a.token, () => start.POST(request("POST", lease), params));
   assert.equal(restarted.status, 410);
   assert.equal((await restarted.json()).error.code, "LEASE_RELEASED");
-  const sent = await context(a.token, () => prompt.POST(request("POST", { clientId: lease.clientId, message: "hello" }), params));
+  const turnId = "0d9a8059-0a3f-45c6-80cb-e1f20d282dd3";
+  const sent = await context(a.token, () => prompt.POST(request("POST", { clientId: lease.clientId, turnId, message: "hello" }), params));
   assert.equal(sent.status, 410);
+  assert.equal((await context(a.token, () => cancel.POST(request("POST", { clientId: lease.clientId, turnId }), params))).status, 410);
   const reconnect = new Request(`https://console.test/api/test?clientId=${lease.clientId}`);
   assert.equal((await context(a.token, () => events.GET(reconnect, params))).status, 204);
   const expired = await context(a.token, () => start.POST(request("POST", {

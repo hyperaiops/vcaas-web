@@ -1,0 +1,25 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.36.7
+    command: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "warning"]
+    ports:
+      - "127.0.0.1:${ENVOY_HTTPS_PORT:-443}:8443"
+    volumes:
+      - type: bind
+        source: ./envoy.local.yaml
+        target: /etc/envoy/envoy.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ENVOY_TLS_CERT:-../.data/tls/tls.crt}
+        target: /etc/envoy/tls/tls.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${ENVOY_TLS_KEY:-../.data/tls/tls.key}
+        target: /etc/envoy/tls/tls.key
+        read_only: true
+        bind:
+          create_host_path: false

@@ -8,17 +8,31 @@ function Arrow({ diagonal = false }: { diagonal?: boolean }) {
   );
 }
 
+function qqGroupUrl(): string | null {
+  const value = process.env.COMMERCIAL_QQ_GROUP_URL;
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && ["qm.qq.com", "jq.qq.com"].includes(url.hostname) && !url.username && !url.password && !url.port
+      ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
 export default function LoginLanding() {
+  const groupUrl = qqGroupUrl();
   return (
     <main className={styles.landing}>
       <div className={styles.shell}>
         <header className={styles.header}>
           <div className={styles.brand} aria-label="随心一码">
-            <span className={styles.brandMark} aria-hidden="true">{'{*}'}</span>
+            <span className={styles.brandMark} aria-hidden="true">{'</>'}</span>
             <span>随心一码<span className={styles.brandDot}>.</span></span>
           </div>
           <nav className={styles.nav} aria-label="首页导航">
             <a className={styles.aboutLink} href="#how-it-works">怎么玩</a>
+            <a className={styles.aboutLink} href="#plans">套餐介绍</a>
             <a className={styles.navLogin} href="/auth/login">登录 / 开始创作 <Arrow diagonal /></a>
           </nav>
         </header>
@@ -80,6 +94,46 @@ export default function LoginLanding() {
             <li><span className={styles.stepNumber}>02 /</span><h3>和 AI 聊天，实现想法</h3><p>用自己的话描述需求，边聊边改。<br />一起做出你的网页、工具和应用。</p></li>
             <li><span className={styles.stepNumber}>03 /</span><h3>Token 永久免费</h3><p>平台不售卖 Token，仅通过广告支持运营。<br />让你的每一个创意，都能免费开始。</p></li>
           </ol>
+        </section>
+
+        <section id="plans" className={styles.plans} aria-labelledby="plans-title">
+          <div className={styles.plansIntro}>
+            <div>
+              <span className={styles.sectionLabel}>找到适合你的创作方式</span>
+              <h2 id="plans-title">好点子，都值得开始<span>.</span></h2>
+            </div>
+            <p>个人创作还是商业需求？<br />选一种适合你的方式，和我们一起创造。</p>
+          </div>
+          <div className={styles.plansTableWrap} role="region" aria-label="套餐对比表，可横向滚动" tabIndex={0}>
+            <table className={styles.plansTable}>
+              <caption className={styles.srOnly}>免费与商业用户方案比较</caption>
+              <thead>
+                <tr>
+                  <th scope="col">方案</th>
+                  <th scope="col"><span className={styles.planBadge}>个人创作</span><strong>免费方案</strong></th>
+                  <th scope="col"><span className={styles.businessBadge}>商业用户</span><strong>商业咨询</strong></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><th scope="row">适合谁</th><td>个人学习与创意探索</td><td>商业用户与团队</td></tr>
+                <tr><th scope="row">使用方式</th><td>平台 Token 永久免费，观看广告支持运营</td><td>通过 QQ 群或微信联系，咨询商业使用</td></tr>
+                <tr><th scope="row">部署方式</th><td>免费部署</td><td>私有部署</td></tr>
+                <tr><th scope="row">上线时长</th><td>最长 1 天，之后下线</td><td>根据需求咨询</td></tr>
+                <tr><th scope="row">备案支持</th><td>—</td><td>协助备案</td></tr>
+                <tr>
+                  <th scope="row">开始方式</th>
+                  <td><a className={styles.planLink} href="/auth/login">免费开始 <span aria-hidden="true">↗</span></a></td>
+                  <td>
+                    <div className={styles.contactDetails}>
+                      <span>QQ 群：1135649093</span>
+                      <span>微信：HyperDevOps</span>
+                      {groupUrl && <a className={styles.qqLink} href={groupUrl} target="_blank" rel="noopener noreferrer">加入 QQ 群 <span aria-hidden="true">↗</span></a>}
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <footer className={styles.footer}>

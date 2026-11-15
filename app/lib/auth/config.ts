@@ -7,7 +7,7 @@ function isLocalHttpDebug(origin: URL): boolean {
 }
 
 export function authConfig() {
-  const origin = new URL(process.env.AUTH_ORIGIN ?? "https://console.vibe-coding.host");
+  const origin = new URL(process.env.AUTH_ORIGIN ?? "https://vibe-coding.host");
   const issuer = new URL(process.env.AUTH_ISSUER ?? "https://vibe-coding-host.authing.cn/oidc");
   if ((origin.protocol !== "https:" && !isLocalHttpDebug(origin)) || issuer.protocol !== "https:") {
     throw new Error("认证需要 HTTPS；仅在开发模式或显式开启 AUTH_ALLOW_HTTP_LOCALHOST 时允许 localhost HTTP 调试。");
@@ -27,7 +27,7 @@ export function authConfig() {
   };
 }
 
-const localHttp = isLocalHttpDebug(new URL(process.env.AUTH_ORIGIN ?? "https://console.vibe-coding.host"));
+const localHttp = isLocalHttpDebug(new URL(process.env.AUTH_ORIGIN ?? "https://vibe-coding.host"));
 // __Host- cookies require Secure; use separate names for explicitly allowed local HTTP debugging.
 export const SESSION_COOKIE = localHttp ? "pi-session-dev" : "__Host-pi-session";
 export const TRANSACTION_COOKIE = localHttp ? "pi-login-dev" : "__Host-pi-login";

@@ -58,7 +58,7 @@ export async function GET(request: Request) {
     const diagnostic = oidcDiagnostic(error);
     console.warn("[auth/callback] Sign-in rejected", { stage, code, ...diagnostic });
     const hint = oidcFailureHint(diagnostic) ?? (code === "LOGIN_COOKIE_MISSING"
-      ? "未找到登录凭据。请从网站首页重新登录，并始终使用相同的域名（本机调试请使用 localhost，不要混用 127.0.0.1 或 ::1）。"
+      ? "未找到登录凭据。请从网站首页重新登录，并始终使用配置的认证域名，不要混用其他域名或 IP 地址。"
       : code === "LOGIN_TRANSACTION_EXPIRED"
         ? "本次登录已过期或回调链接已被使用，请从网站首页重新登录。"
         : "请重新登录。如仍然失败，请仅将下方错误编号提供给管理员，不要发送带授权码的完整地址。");

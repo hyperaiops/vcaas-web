@@ -11,7 +11,8 @@ type Session = {
   ensureAgentSession(id: string, lease: Lease): Promise<Handle>;
   releaseAgentLease(id: string, lease: Lease): Promise<void>;
   forceShutdown(id: string): Promise<void>;
-  sendPrompt(id: string, clientId: string, message: string): Promise<void>;
+  sendPrompt(id: string, clientId: string, message: string, turnId?: string): Promise<void>;
+  cancelTurn(id: string, clientId: string, turnId: string): Promise<void>;
   subscribe(id: string, clientId: string, callback: (frame: string) => void): (() => void) | null;
 };
 function deferred<T>() {
@@ -48,8 +49,13 @@ function harness(options: { ensure?: (signal: AbortSignal) => Promise<Handle>; r
   const source = readFileSync(new URL("../app/lib/bridge/session.ts", import.meta.url), "utf8");
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText;
   const exports = {} as Session;
+  class TestLifecycleError extends Error {
+    constructor(public status: number, public code: string, message: string) { super(message); }
+  }
   const modules: Record<string, unknown> = {
     "server-only": {}, "node:crypto": { randomUUID: () => "request-id" }, "node:tls": {}, ws: Socket,
+    "@/app/lib/bridge/runtime": { runtimeMode: () => "prod", BridgeLifecycleError: TestLifecycleError },
+    "@/app/lib/bridge/local": { LocalPiTransport: class {} },
     "@/app/lib/bridge/k8s": {
       ensurePiWorker: async (_id: string, signal: AbortSignal) => {
         ensureCalls++; signals.push(signal); order.push("ensure");
@@ -59,7 +65,7 @@ function harness(options: { ensure?: (signal: AbortSignal) => Promise<Handle>; r
     },
   };
   runInNewContext(code, {
-    exports, process: { env: {} }, Buffer, URL, AbortController,
+    exports, process: { env: { PI_RUNTIME_MODE: "prod" } }, Buffer, URL, AbortController,
     Date: { now: () => now }, console: { error() {} },
     setTimeout(fn: () => void, ms: number) { const key = { unref() {} }; timers.set(key, { at: now + ms, fn }); return key; },
     clearTimeout(key: object) { timers.delete(key); },
@@ -137,6 +143,22 @@ test("subscriber-free grace expires at exactly 30 seconds even while the agent i
   await assert.rejects(h.session.sendPrompt("project", lease().clientId, "late"), { status: 410 });
 });
 
+test("a missing settlement event is reported as uncertain instead of accepting another turn", async () => {
+  const h = harness();
+  await h.session.ensureAgentSession("project", lease());
+  const frames: string[] = [];
+  h.session.subscribe("project", lease().clientId, frame => frames.push(frame));
+  await h.session.sendPrompt("project", lease().clientId, "hello", "turn-1");
+  const socket = h.sockets[0];
+  const prompt = JSON.parse(socket.sent[0]);
+  socket.frame({ type: "response", command: "prompt", id: prompt.id, success: true });
+  socket.frame({ type: "agent_start" });
+  socket.frame({ type: "agent_end", willRetry: false });
+  await h.advance(30_000);
+  assert.ok(frames.some(frame => frame.includes('"phase":"uncertain"')));
+  await assert.rejects(h.session.sendPrompt("project", lease().clientId, "next", "turn-2"), { status: 409 });
+});
+
 test("duplicate concurrent and completed starts are idempotent and cannot change lease issuance", async () => {
   const provision = deferred<Handle>();
   const h = harness({ ensure: () => provision.promise });
@@ -165,9 +187,11 @@ test("reconnect is single-flight and stale socket events cannot deliver frames o
   old.frame({ type: "agent_end" });
   old.emit("close");
   old.emit("error", new Error("stale"));
-  h.sockets[1].frame({ type: "text_delta", delta: "fresh" });
+  h.sockets[1].frame({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "fresh" } });
   await flush();
-  assert.deepEqual(frames.map(frame => JSON.parse(frame)), [{ type: "text_delta", delta: "fresh" }]);
+  const delivered = frames.map(frame => JSON.parse(frame));
+  assert.ok(delivered.some(frame => frame.type === "turn_event" && frame.event.kind === "text" && frame.event.delta === "fresh"));
+  assert.ok(!frames.some(frame => frame.includes("stale")));
   assert.equal(h.ensures, 2);
   assert.equal(h.sockets[1].sent.length, 1);
   assert.equal(h.sockets[1].readyState, 1);
@@ -186,7 +210,8 @@ test("force shutdown fences all existing and future leases and ignores late sock
   await flush();
   assert.equal(h.deletes, 1);
   assert.equal(h.ensures, 1);
-  assert.deepEqual(frames, []);
+  assert.equal(frames.length, 1);
+  assert.equal(JSON.parse(frames[0]).type, "turn_snapshot");
 });
 
 test("start-stop-start waits for deferred deletion before provisioning the replacement", async () => {

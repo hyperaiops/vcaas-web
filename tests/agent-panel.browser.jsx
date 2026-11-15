@@ -27,6 +27,9 @@ window.EventSource = class {
 const starts = () => requests.filter((r) => r.url.endsWith('/start'));
 const stops = () => requests.filter((r) => r.url.endsWith('/stop'));
 const prompts = () => requests.filter((r) => r.url.endsWith('/prompt'));
+const cancels = () => requests.filter((r) => r.url.endsWith('/cancel'));
+const frame = (source, value) => source.onmessage({ data: JSON.stringify(value) });
+const snapshot = (source, sequence = 0, busy = false, turn) => frame(source, { type: 'turn_snapshot', version: 1, sequence, busy, turn });
 const root = createRoot(document.getElementById('root'));
 const render = (workspaceId) => act(async () => { root.render(<StrictMode><AgentPanel workspaceId={workspaceId} /></StrictMode>); await tick(); });
 const page = (type, persisted = false) => act(async () => { window.dispatchEvent(new PageTransitionEvent(type, { persisted })); await tick(); });
@@ -55,6 +58,7 @@ async function run() {
   assert(sources.length === 0, 'late first start subscribed');
   await resolve(second);
   assert(sources[0].url.endsWith(`?clientId=${second.body.clientId}`), 'events missing lease');
+  await act(async () => { snapshot(sources[0]); });
   const staleMessage = sources[0].onmessage;
   const staleError = sources[0].onerror;
   await send('old prompt');
@@ -71,6 +75,7 @@ async function run() {
   const third = starts()[2];
   assert(third.body.clientId !== second.body.clientId, 'BFCache reused lease');
   await resolve(third);
+  await act(async () => { snapshot(sources[1]); });
   await send('new prompt');
   assert(prompts()[1].body.clientId === third.body.clientId, 'restored prompt used old lease');
   await act(async () => {
@@ -82,13 +87,29 @@ async function run() {
   });
   assert(document.body.textContent.includes('正在处理'), 'stale response cleared new busy state');
   assert(!document.body.textContent.includes('STALE') && !document.body.textContent.includes('消息发送失败'), 'stale callbacks changed messages');
+  const turnId = prompts()[1].body.turnId;
+  assert(turnId && document.body.textContent.includes('停止'), 'active turn must expose stop before text');
   await act(async () => {
-    sources[1].onmessage({ data: JSON.stringify({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: '正常回复' } }) });
-    sources[1].onmessage({ data: JSON.stringify({ type: 'agent_end', willRetry: true }) });
+    snapshot(sources[1], 1, true, { id: turnId, text: '', phase: 'running', activities: [] });
+    frame(sources[1], { type: 'turn_event', version: 1, sequence: 2, turnId, event: { kind: 'text', delta: '正常回复' } });
+    frame(sources[1], { type: 'turn_event', version: 1, sequence: 3, turnId, event: { kind: 'activity', activity: { id: 'tool-1', name: 'bash', status: 'running' } } });
+    frame(sources[1], { type: 'turn_event', version: 1, sequence: 4, turnId, event: { kind: 'phase', phase: 'retrying' } });
   });
-  assert(document.body.textContent.includes('正常回复') && document.body.textContent.includes('正在处理'), 'stream/retry behavior regressed');
-  await act(async () => { sources[1].onmessage({ data: JSON.stringify({ type: 'agent_end' }) }); });
-  assert(document.body.textContent.includes('等待输入'), 'agent_end did not complete');
+  assert(document.body.textContent.includes('正常回复') && document.body.textContent.includes('正在重试'), 'stream/retry behavior regressed');
+  assert(document.body.textContent.includes('执行命令') && document.body.textContent.includes('进行中'), 'tool activity missing');
+  await act(async () => {
+    [...document.querySelectorAll('button')].find((button) => button.textContent.trim() === '停止').click();
+    await tick();
+  });
+  assert(cancels().length === 1 && cancels()[0].body.turnId === turnId, 'stop did not request the active turn');
+  assert(document.body.textContent.includes('正在停止'), 'pending stop not visible');
+  await act(async () => {
+    snapshot(sources[1], 5, false, { id: turnId, text: '正常回复', phase: 'stopped', activities: [{ id: 'tool-1', name: 'bash', status: 'done' }] });
+  });
+  assert(document.body.textContent.includes('等待输入') && document.body.textContent.includes('已停止'), 'terminal snapshot did not finish turn');
+  await resolve(cancels()[0]);
+  await send('after stop');
+  assert(prompts().length === 3, 'cannot send another prompt after stopping');
   await page('pagehide');
   await act(async () => { root.unmount(); await tick(); });
   assert(stops().length === 3, 'unmount double-released hidden lease');

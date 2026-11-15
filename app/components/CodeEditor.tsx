@@ -180,7 +180,7 @@ function FileTreeItem({
       type="button"
       onClick={() => onSelect(node.path)}
       className={`flex w-full items-center gap-1 rounded px-1.5 py-0.5 text-left text-[13px] ${
-        activePath === node.path ? "bg-blue-50 text-blue-700" : "text-neutral-700 hover:bg-neutral-100"
+        activePath === node.path ? "bg-[#e9e4fb] text-[#594b9b]" : "text-neutral-700 hover:bg-[#eff5d9]"
       }`}
       style={{ paddingLeft: depth * 10 + 18 }}
     >
@@ -346,9 +346,9 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
   return (
     <div className="flex h-full flex-col bg-white">
       {/* Editor toolbar */}
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-neutral-200 px-3">
-        <span className="text-[13px] font-medium tracking-wide text-neutral-600 uppercase">代码</span>
-        <span className="max-w-[16rem] truncate font-mono text-[13px] text-neutral-500" title={activePath ?? ""}>
+      <div className="flex min-h-10 shrink-0 items-center gap-2 border-b border-[var(--brand-line)] bg-[#f0f2e9] px-3">
+        <span className="text-[13px] font-bold text-[var(--brand-ink)]">代码</span>
+        <span className="min-w-0 max-w-[16rem] flex-1 truncate font-mono text-[13px] text-[var(--brand-muted)]" title={activePath ?? ""}>
           {activePath ?? "未选择文件"}
         </span>
         {isDirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title="有未保存的更改" />}
@@ -356,7 +356,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
         <button
           type="button"
           onClick={() => void refreshTree()}
-          className="ml-auto rounded border border-neutral-300 px-2 py-0.5 text-[13px] text-neutral-600 hover:bg-neutral-100"
+          className="ml-auto min-h-8 shrink-0 rounded-md border border-[#cbd1c0] bg-white px-2.5 py-1 text-[13px] text-[var(--brand-ink)] hover:bg-[#eff5d9]"
           title="重新读取磁盘中的文件"
         >
           刷新文件
@@ -369,7 +369,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
 
       <div className="flex min-h-0 flex-1">
         {/* File tree */}
-        <aside className="w-52 shrink-0 overflow-y-auto border-r border-neutral-200 py-2">
+        <aside className="w-36 shrink-0 overflow-y-auto border-r border-[var(--brand-line)] bg-[#fafbf5] py-2 sm:w-52">
           {loading ? (
             <p className="px-3 py-2 text-[13px] text-neutral-400">正在加载…</p>
           ) : treeView.length === 0 ? (

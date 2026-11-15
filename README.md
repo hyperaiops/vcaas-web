@@ -8,6 +8,10 @@ Browser-based IDE with a coding agent (PI) on the left and a live WebContainer p
 首页、工作区、聊天、编辑器、预览及登录提示使用简体中文；代码、文件名、用户内容、
 终端进程输出和必要的技术名称保持原样。
 
+首页展示商业咨询 QQ 群号 `1135649093` 和微信号 `HyperDevOps`。可通过服务端环境变量
+`COMMERCIAL_QQ_GROUP_URL` 配置 `https://qm.qq.com/…` 或 `https://jq.qq.com/…` 的官方入群链接；
+未配置或地址不合法时仅显示群号和微信号，不生成虚假链接。Kubernetes 部署需要把该变量加入 Deployment。
+
 字体统一在 `app/globals.css` 的 `:root` 中配置：
 - `--font-chinese-ui`：中文界面字体，优先使用系统已安装的苹方、微软雅黑等。
 - `--font-code`：代码与终端的等宽字体及中文回退字体。
@@ -16,6 +20,14 @@ Browser-based IDE with a coding agent (PI) on the left and a live WebContainer p
 `scripts/prepare-monaco.mjs` 从本机依赖复制到 `public/monaco`，随 `dev` / `build`
 自动准备，按需从本站加载，不使用 CDN。生成目录已忽略；若其中混入手动修改或陌生文件，
 脚本会拒绝覆盖，请先检查内容，不要直接删除。
+
+## WebContainer 依赖安装
+
+WebContainer 启动 shell、依赖安装和开发服务器进程时，通过进程环境变量
+`npm_config_registry=https://registry.npmmirror.com/` 设置 npm 和 pnpm 的默认仓库；
+这些进程启动的子进程也会继承该设置。不修改宿主机或工作区的 `.npmrc` 和锁文件。
+scoped 仓库、锁文件中固定的下载地址或另行启动的进程可能仍使用其他来源；该设置
+也不改变 StackBlitz 托管的 WebContainer 运行时。
 
 ## 将本地密钥写入 Kubernetes
 
@@ -69,9 +81,9 @@ Configure these exact URLs in Authing:
 
 | Setting | URL |
 | --- | --- |
-| Login callback | `https://console.vibe-coding.host/auth/callback` |
-| Logout callback | `https://console.vibe-coding.host/` |
-| Login initiation | `https://console.vibe-coding.host/auth/login` |
+| Login callback | `https://vibe-coding.host/auth/callback` |
+| Logout callback | `https://vibe-coding.host/` |
+| Login initiation | `https://vibe-coding.host/auth/login` |
 
 Set `AUTH_ORIGIN`, `AUTH_ISSUER`, and `AUTH_CLIENT_ID` as shown in `.env.example`.
 Set `AUTH_CLIENT_SECRET` and `AUTH_SESSION_KEY` only in the server environment
@@ -83,17 +95,63 @@ stable across restarts; changing it prevents provider logout for old sessions.
 The registered HTTPS origin must reach the application through a trusted ingress
 or equivalent TLS endpoint. The supplied ClusterIP Service does **not** create
 DNS, HTTPS ingress, certificates, or Authing application configuration. Local HTTP
-port-forwarding alone cannot complete this production callback flow. For local
-`npm run dev` / `pnpm dev`, set `AUTH_ORIGIN=http://localhost:3000` and add
-`http://localhost:3000/auth/callback` to Authing's login callback allowlist and
-`http://localhost:3000/` to its logout callback allowlist. Local HTTP uses separate
-non-Secure, HttpOnly cookies without the `__Host-` prefix. Outside production,
-this exception is limited to loopback hosts. To debug a production container via
-localhost port-forwarding, explicitly set `AUTH_ALLOW_HTTP_LOCALHOST=true` and
-`AUTH_ORIGIN=http://localhost:3000`; the supplied deployment currently enables
-this local debugging mode. Remote HTTP remains rejected. Disable the flag and
-restore the public HTTPS origin before public deployment. Always use `localhost`
-consistently rather than switching between it and `127.0.0.1`.
+port-forwarding alone cannot complete this production callback flow.
+
+### Local SSO with the production hostname
+
+Local development uses the same Authing SSO as production, including when
+`PI_RUNTIME_MODE=local`. To test `https://vibe-coding.host` against the local
+application:
+
+1. Add `127.0.0.1 vibe-coding.host` to your hosts file. This affects only name
+   resolution; it does not provide HTTPS or forward port 443.
+2. Obtain a certificate and private key for `vibe-coding.host` that your browser
+   trusts (for example, a locally trusted mkcert certificate). Place them at
+   `.data/tls/tls.crt` and `.data/tls/tls.key`. This directory is ignored by Git
+   and excluded from Docker build contexts; keep the private key restricted to
+   your user. Alternatively, set `ENVOY_TLS_CERT` and `ENVOY_TLS_KEY` to absolute
+   paths outside the repository. The files are mounted read-only, and Docker Compose
+   will fail if they are missing.
+3. Set `AUTH_ORIGIN=https://vibe-coding.host`, `AUTH_CLIENT_SECRET`, and
+   `AUTH_SESSION_KEY` in `.env.local`, and ensure the Authing URLs above are
+   registered. Set `PI_RUNTIME_MODE=local`, run `pnpm dev`, and keep it running.
+   The Next.js development server binds to `127.0.0.1:3000`.
+4. Start Envoy with Docker Desktop:
+
+   ```bash
+   docker compose -f deploy/compose.envoy.yaml up -d
+   # Open https://vibe-coding.host
+   # When finished:
+   docker compose -f deploy/compose.envoy.yaml down
+   ```
+
+   Envoy listens on `127.0.0.1:443` and forwards to the host's port 3000. It
+   preserves the Host and HTTPS scheme, supports WebSocket upgrades, and keeps
+   event streams open. Port 443 must be free before starting. For a proxy-only
+   connectivity test, set `ENVOY_HTTPS_PORT` to an unused port; the alternate
+   origin is not the registered Authing callback and will not complete SSO.
+   Restart Envoy after replacing the certificate or key.
+
+   If Envoy cannot reach the app, check that Docker Desktop can reach the
+   loopback-only Next.js server using `host.docker.internal`:
+
+   ```bash
+   docker run --rm curlimages/curl:latest --noproxy '*' --connect-timeout 5 http://host.docker.internal:3000/api/healthz
+   ```
+
+   Host-loopback reachability can vary by Docker setup. Do not rebind the local
+   development server to a public interface as a workaround.
+
+The hosts entry redirects this hostname away from production; remove it after
+local testing. Use a separate browser profile: local and production share an
+origin and therefore cookies, and SSO logout may affect the production session.
+Do not expose the proxy or development server to the network: the local agent can
+execute commands on this host. Workspaces created by the former local administrator
+remain in SQLite but are not automatically assigned to an Authing user.
+
+For local HTTP debugging of a production container, `AUTH_ALLOW_HTTP_LOCALHOST`
+is an explicit opt-in; the supplied production deployment leaves it disabled and
+uses HTTPS. Remote HTTP remains rejected.
 
 Every workspace API checks the signed-in owner before filesystem or agent
 operations. Missing sessions return JSON 401, and non-owned workspaces return 404.
@@ -130,22 +188,29 @@ Kubernetes permissions. Verify the per-workspace NFS/PVC mount isolation before
 enabling agents for untrusted users; Service RPC transport alone does not provide
 filesystem isolation.
 
-### PiWorker 内部 Service RPC
+### Agent 运行模式（local / prod）
 
-集群内运行 webcontainer 时设置 `PI_CONNECTION_MODE=service`（`deployment.yaml`
-已设置）。后端使用每个 PiWorker 的 `status.serviceName`，通过
-`ws://<serviceName>.<PI_NAMESPACE>.svc:8080/v1/rpc` 连接 agent，不走 Ingress。
-Bearer token 认证和项目归属检查保持不变，token 不交给浏览器。
+项目通过显式的 `PI_RUNTIME_MODE` 只保留两种运行模式（必须配置，不自动猜测）：
 
-连接链路为：浏览器 → webcontainer 后端 → PiWorker ClusterIP Service → agent。
+- **`PI_RUNTIME_MODE=local`**（本地开发）：在服务端启动本机
+  `pi --mode rpc --no-session --provider litellm`，工作目录为该工作区在本机磁盘上的
+  目录，直接读写本地文件。LiteLLM API key 写入 0600 权限的临时密钥文件后按路径传入，
+  不出现在命令行或常规环境变量中，进程退出时删除。pi 的 HOME 隔离在
+  `.data/pi-home/<workspaceId>`（可用 `PI_LOCAL_HOME_ROOT` 覆盖）。`PI_BIN` 可指定
+  二进制路径（默认 `pi`）。`NODE_ENV=production` 时该模式被拒绝——生产服务器绝不
+  运行本地编码 CLI。
+- **`PI_RUNTIME_MODE=prod`**（线上部署，`deploy/deployment.yaml` 已设置）：webcontainer 后端
+  使用每个 PiWorker 的 `status.serviceName`，通过
+  `ws://<serviceName>.<PI_NAMESPACE>.svc:8080/v1/rpc` 连接 agent，不使用 Ingress
+  endpoint，也没有 endpoint 模式或 TLS 转发配置。Bearer token 认证和项目归属检查
+  保持不变，token 不交给浏览器。
+
+prod 连接链路为：浏览器 → webcontainer 后端 → PiWorker ClusterIP Service → agent。
 `kubectl port-forward svc/webcontainer 3000:3000` 只转发 Web UI；RPC 仍从集群内的
-webcontainer Pod 发出。本机运行 Next.js 时，仅持有 kubeconfig 并不能解析或访问
-集群 Service DNS，通常应使用默认的 `PI_CONNECTION_MODE=endpoint`。
+webcontainer Pod 发出。
 
-未设置连接模式时，继续使用 PiWorker 的 `status.endpoint`。Service 模式不会在
-缺少 Service 名时回退公网，也不使用 `PI_INGRESS_FORWARD_*` 的 TLS 转发。
-当前 PiWorker operator 仍会创建 Ingress 资源；本功能只绕开 RPC 的 Ingress 数据路径，
-不修改 operator/CRD，也不删除其管理的资源。
+当前 PiWorker operator 仍会创建 Ingress 资源；本应用不使用其 RPC 数据路径，
+也不修改 operator/CRD，不删除其管理的资源。
 
 ### 离开工作区后的 agent 回收
 

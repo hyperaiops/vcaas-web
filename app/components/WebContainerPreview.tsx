@@ -16,15 +16,24 @@ const CodeEditor = dynamic(() => import("@/app/components/CodeEditor"), {
 });
 
 type View = "preview" | "code";
+type ConsoleSize = "hidden" | "compact" | "expanded";
 
 type Status = "booting" | "loading" | "installing" | "starting" | "ready" | "stopped" | "error";
 
 const WORKSPACE_ID_FALLBACK = "workspace";
+const PACKAGE_MANAGER_ENV = { npm_config_registry: "https://registry.npmmirror.com/" };
+
+function safePreviewText(value: unknown): string {
+  let text: string;
+  try { text = typeof value === "string" ? value : String(value); } catch { text = "[无法显示]"; }
+  return text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "").slice(0, 4000);
+}
 
 // WebContainer is a strict singleton per page. Booting twice throws
 // "Only a single WebContainer instance can be booted", so keep the instance
 // (and its one-time boot) outside the component.
 let bootPromise: Promise<WebContainer> | null = null;
+let bootQueue: Promise<void> = Promise.resolve();
 function getWebContainer(): Promise<WebContainer> {
   if (!bootPromise) {
     bootPromise = import("@webcontainer/api").then(({ WebContainer }) =>
@@ -38,12 +47,20 @@ type Props = { workspaceId: string | null };
 
 export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Props) {
   const terminalRef = useRef<HTMLDivElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const terminalWriteRef = useRef<((message: string) => void) | null>(null);
+  const previewUrlRef = useRef<string | null>(null);
+  const previewPortRef = useRef<number | null>(null);
+  const bridgeReadyRef = useRef(0);
+  const bridgeLastLoadRef = useRef(0);
+  const bridgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bridgeInstalledRef = useRef(false);
+  const [consoleSize, setConsoleSize] = useState<ConsoleSize>("compact");
   const [status, setStatus] = useState<Status>("booting");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
-  const [copiedUrl, setCopiedUrl] = useState(false);
   const [view, setView] = useState<View>("preview");
   // Keep a handle on the running dev server so Stop can kill it without
   // tearing down the whole effect (WebContainer stays alive).
@@ -53,19 +70,61 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
   const stoppedRef = useRef(false);
 
   useEffect(() => {
+    let windowStart = 0;
+    let count = 0;
+    const onMessage = (event: MessageEvent) => {
+      if (!previewUrlRef.current || event.source !== iframeRef.current?.contentWindow) return;
+      let origin: string;
+      try { origin = new URL(previewUrlRef.current).origin; } catch { return; }
+      if (event.origin !== origin || !event.data || typeof event.data !== "object") return;
+      const data = event.data as { type?: unknown; version?: unknown; level?: unknown; text?: unknown };
+      if (data.type !== "webcontainer-preview-console" || data.version !== 1) return;
+      if (data.level === "ready") {
+        bridgeReadyRef.current++;
+        if (bridgeTimerRef.current) {
+          clearTimeout(bridgeTimerRef.current);
+          bridgeTimerRef.current = null;
+          bridgeLastLoadRef.current = bridgeReadyRef.current;
+        }
+        return;
+      }
+      if ((data.level !== "log" && data.level !== "info" && data.level !== "warn") || typeof data.text !== "string" || data.text.length > 4000) return;
+      const now = Date.now();
+      if (now - windowStart >= 1000 || now < windowStart) { windowStart = now; count = 0; }
+      if (count++ >= 50) return;
+      terminalWriteRef.current?.(`[预览 ${data.level}] ${safePreviewText(data.text)}\r\n`);
+    };
+    window.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("message", onMessage);
+      if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
+      bridgeTimerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     // Wait until a workspace has been selected before booting/mounting.
     if (!workspaceIdProp) return;
     const workspaceId = workspaceIdProp ?? WORKSPACE_ID_FALLBACK;
     let cancelled = false;
     let shell: WebContainerProcess | null = null;
     let dev: WebContainerProcess | null = null;
+    let startingServer = false;
     let terminal: { write(data: string): void; dispose(): void } | null = null;
+    let observer: ResizeObserver | null = null;
+    let writer: ((message: string) => void) | null = null;
+    const processes = new Set<WebContainerProcess>();
+    const unsubscribe: Array<() => void> = [];
     const controller = new AbortController();
-    // Killing a container process rejects the pending pipeTo() promise with
-    // "Process aborted". Swallowing it here keeps it out of unhandledRejection.
-    const ignoreAbort = () => {};
     const addLog = (message: string) => {
-      if (!cancelled) setLogs((previous) => [...previous, message].slice(-100));
+      if (!cancelled) setLogs((previous) => [...previous, message.slice(-4000)].slice(-100));
+    };
+    const own = async (pending: Promise<WebContainerProcess>) => {
+      const process = await pending;
+      if (cancelled) { process.kill(); return null; }
+      processes.add(process);
+      void process.exit.then(() => processes.delete(process), () => processes.delete(process));
+      return process;
     };
 
     async function fetchSnapshot(url: string): Promise<Response> {
@@ -97,6 +156,13 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     async function boot() {
       try {
         stoppedRef.current = false;
+        previewUrlRef.current = null;
+        previewPortRef.current = null;
+        bridgeReadyRef.current = 0;
+        bridgeLastLoadRef.current = 0;
+        bridgeInstalledRef.current = false;
+        if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
+        bridgeTimerRef.current = null;
         setStatus("booting");
         setPreviewUrl(null);
         setError(null);
@@ -108,9 +174,11 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         await import("@xterm/xterm/css/xterm.css");
         if (cancelled || !terminalRef.current) return;
 
+        const host = terminalRef.current;
         const xterm = new Terminal({
           convertEol: true,
           fontSize: 13,
+          scrollback: 1000,
           fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim() || "monospace",
           theme: {
             background: "#ffffff",
@@ -122,31 +190,46 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         terminal = xterm;
         const fitAddon = new FitAddon();
         xterm.loadAddon(fitAddon);
-        xterm.open(terminalRef.current);
-        fitAddon.fit();
+        xterm.open(host);
+        writer = (message) => {
+          if (cancelled) return;
+          xterm.write(message);
+          addLog(message);
+        };
+        terminalWriteRef.current = writer;
+        const fit = () => {
+          if (cancelled || !host.clientWidth || !host.clientHeight) return;
+          fitAddon.fit();
+          try { shell?.resize({ cols: xterm.cols, rows: xterm.rows }); } catch { /* shell may have exited */ }
+        };
+        observer = new ResizeObserver(fit);
+        observer.observe(host);
+        fit();
+        writer("[系统] 正在启动 WebContainer…\r\n");
 
         // Singleton boot — safe to call on every effect run (refresh).
         const container = await getWebContainer();
         if (cancelled) return;
-        container.on("error", ({ message }) => {
-          addLog(`WebContainer 错误： ${message}`);
+        unsubscribe.push(container.on("error", ({ message }) => {
+          writer?.(`[WebContainer] ${safePreviewText(message)}\r\n`);
           if (!cancelled) { setStatus("error"); setError("WebContainer 运行异常，请查看终端输出后重试。"); }
-        });
-        container.on("preview-message", (message) => {
-          const detail = "message" in message ? message.message : message.args.map(String).join(" ");
-          addLog(`预览错误： ${detail}`);
-        });
-        container.on("server-ready", (_port, url) => {
-          // The iframe must load once the HTTP listener is actually up.
-          // Deferring with a short retry prevents the "blank first paint"
-          // that happens when the frame races the listener.
+        }));
+        unsubscribe.push(container.on("preview-message", (message) => {
+          if (message.port !== previewPortRef.current) return;
+          const detail = "message" in message ? safePreviewText(message.message) : message.args.slice(0, 10).map(safePreviewText).join(" ");
+          writer?.(`[预览 error] ${detail.slice(0, 4000)}\r\n`);
+        }));
+        unsubscribe.push(container.on("server-ready", (port, url) => {
+          if (cancelled || stoppedRef.current || !startingServer) return;
+          previewPortRef.current = port;
+          // Wait briefly for the listener before rendering the iframe.
           void (async () => {
             for (let attempt = 0; attempt < 20; attempt++) {
-              if (cancelled) return;
+              if (cancelled || stoppedRef.current) return;
               try {
-                const probe = await fetch(url, { mode: "no-cors", cache: "no-store" });
+                const probe = await fetch(url, { mode: "no-cors", cache: "no-store", signal: controller.signal });
                 if (probe) {
-                  if (!cancelled) { setPreviewUrl(url); setStatus("ready"); }
+                  if (!cancelled && !stoppedRef.current) { previewUrlRef.current = url; setPreviewUrl(url); setStatus("ready"); }
                   return;
                 }
               } catch {
@@ -154,68 +237,95 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
               }
               await new Promise((resolve) => setTimeout(resolve, 400));
             }
-            if (!cancelled) { setPreviewUrl(url); setStatus("ready"); }
+            if (!cancelled && !stoppedRef.current) { previewUrlRef.current = url; setPreviewUrl(url); setStatus("ready"); }
           })();
-        });
+        }));
+        try {
+          const script = new URL("/preview-console.js", window.location.origin);
+          script.searchParams.set("parentOrigin", window.location.origin);
+          await container.setPreviewScript(script.href, { async: false, defer: false });
+          if (cancelled) return;
+          bridgeInstalledRef.current = true;
+        } catch {
+          writer?.("[系统] 无法启用预览页面日志转发，进程日志仍可使用。\r\n");
+        }
+        if (cancelled) return;
 
         setStatus("loading");
+        writer?.("[系统] 正在加载工作区快照（第一次可能较慢）…\r\n");
         await mountWorkspace(container);
         if (cancelled) return;
 
-        shell = await container.spawn("jsh", { terminal: { cols: xterm.cols, rows: xterm.rows } });
-        const shellOutput = new WritableStream({ write(data: string) { xterm.write(data); addLog(data); } });
-        shell.output.pipeTo(shellOutput).catch(ignoreAbort);
-        // Keep the shell running for npm/vite output, but make the terminal
-        // read-only — users shouldn't type into it.
-        // xterm.onData((data) => { void input.write(data); });
+        const pipeOutput = (process: WebContainerProcess) => {
+          void process.output.pipeTo(new WritableStream({ write(data: string) { writer?.(data); } })).catch(() => {
+            if (!cancelled && !stoppedRef.current) writer?.("[系统] 无法读取进程输出。\r\n");
+          });
+        };
+        shell = await own(container.spawn("jsh", { terminal: { cols: xterm.cols, rows: xterm.rows }, env: PACKAGE_MANAGER_ENV }));
+        if (!shell) return;
+        pipeOutput(shell);
+        fit();
 
         setStatus("installing");
-        // pnpm is faster than npm inside WebContainer (content-addressed
-        // store survives container restarts), and LIGHTNINGCSS_FORCE_WASM=1
-        // keeps Tailwind v4 from downloading the native linux-x64 binding.
-        const install = await container.spawn("pnpm", ["install", "--prefer-offline"], {
-          env: { LIGHTNINGCSS_FORCE_WASM: "1" },
-        });
-        install.output.pipeTo(new WritableStream({ write(data: string) { xterm.write(data); addLog(data); } })).catch(ignoreAbort);
+        writer?.("[系统] 正在安装依赖（第一次可能较慢）…\r\n");
+        // Use the browser container's mirror and force the portable CSS binding.
+        const install = await own(container.spawn("pnpm", ["install", "--prefer-offline"], {
+          env: { ...PACKAGE_MANAGER_ENV, LIGHTNINGCSS_FORCE_WASM: "1" },
+        }));
+        if (!install) return;
+        pipeOutput(install);
         if ((await install.exit) !== 0) throw new Error("WebContainer 中的 `pnpm install` 执行失败。");
         if (cancelled) return;
 
         setStatus("starting");
-        // Turbo/webpack cache dirs can be corrupted inside a snapshot
-        // (e.g. after COEP isolation changes), which makes the dev server
-        // silently render a blank page. Clearing it forces a clean compile.
-        const clean = await container.spawn("rm", ["-rf", ".next"]);
+        writer?.("[系统] 正在启动开发服务器…\r\n");
+        // Clear potentially stale WebContainer build output before starting.
+        const clean = await own(container.spawn("rm", ["-rf", ".next"]));
+        if (!clean) return;
         await clean.exit;
-        // The workspace's package.json already forces webpack (Turbopack
-        // needs native bindings that WASM-only WebContainer can't provide).
-        dev = await container.spawn("pnpm", ["run", "dev"]);
-        devRef.current = dev;
-        dev.output.pipeTo(new WritableStream({ write(data: string) { xterm.write(data); addLog(data); } })).catch(ignoreAbort);
-        void dev.exit.then((code) => {
-          const wasStopped = stoppedRef.current;
-          devRef.current = null;
-          // A kill from the Stop button is expected — don't report it as an error.
-          if (!cancelled && code !== 0 && !wasStopped) {
-            addLog(`开发服务器已退出，退出码为 ${code}。`);
+        if (cancelled) return;
+        startingServer = true;
+        dev = await own(container.spawn("pnpm", ["run", "dev"], { env: PACKAGE_MANAGER_ENV }));
+        if (!dev) return;
+        const runningDev = dev;
+        devRef.current = runningDev;
+        pipeOutput(runningDev);
+        void runningDev.exit.then((code) => {
+          if (devRef.current === runningDev) devRef.current = null;
+          if (!cancelled && code !== 0 && !stoppedRef.current) {
+            writer?.(`[系统] 开发服务器已退出，退出码为 ${code}。\r\n`);
             setStatus("error");
             setError(`开发服务器已退出，退出码为 ${code}。请查看下方终端输出。`);
           }
+        }).catch(() => {
+          if (!cancelled && !stoppedRef.current) {
+            writer?.("[系统] 无法确认开发服务器状态。\r\n");
+            setStatus("error");
+            setError("开发服务器状态异常，请查看下方终端输出。");
+          }
         });
       } catch (reason) {
-        if (!cancelled) { console.error("WebContainer startup failed", reason); setStatus("error"); setError("WebContainer 启动失败，请查看终端输出后重试。"); }
+        if (!cancelled) {
+          console.error("WebContainer startup failed", reason);
+          writer?.("[系统] 启动失败，请检查上方终端输出后重试。\r\n");
+          setStatus("error");
+          setError("WebContainer 启动失败，请查看终端输出后重试。");
+        }
       }
     }
 
-    void boot();
+    // A stale mount must finish or cancel before the singleton mounts another workspace.
+    bootQueue = bootQueue.catch(() => {}).then(async () => { if (!cancelled) await boot(); });
     return () => {
       cancelled = true;
       controller.abort();
-      // Do NOT call container.teardown() here — it races the boot/mount
-      // pipeline and surfaces as "unhandledRejection: Process aborted".
-      // Killing the child processes is enough; the container itself is
-      // a singleton that lives until the page unloads.
-      dev?.kill();
-      shell?.kill();
+      observer?.disconnect();
+      for (const off of unsubscribe) off();
+      for (const process of processes) {
+        try { process.kill(); } catch { /* process already exited */ }
+      }
+      if (devRef.current === dev) devRef.current = null;
+      if (terminalWriteRef.current === writer) terminalWriteRef.current = null;
       terminal?.dispose();
     };
   }, [refreshKey, workspaceIdProp]);
@@ -295,38 +405,67 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     stoppedRef.current = true;
     devRef.current?.kill();
     devRef.current = null;
+    previewUrlRef.current = null;
+    previewPortRef.current = null;
+    if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
+    bridgeTimerRef.current = null;
+    terminalWriteRef.current?.("[系统] 开发服务器已停止。\r\n");
     setPreviewUrl(null);
     setStatus("stopped");
   }
 
-  const statusLabel: Record<Status, string> = { booting: "正在启动容器…", loading: "正在加载工作区…", installing: "正在安装依赖…", starting: "正在启动服务器…", ready: "运行中", stopped: "已停止", error: "启动失败" };
+  const statusLabel: Record<Status, string> = { booting: "正在启动容器…", loading: "正在加载工作区…", installing: "正在安装依赖…（第一次可能较慢）", starting: "正在启动服务器…", ready: "运行中", stopped: "已停止", error: "启动失败" };
 
-  // Fixed terminal size: small while loading, larger once running (derived,
-  // no state/effect needed).
-  const terminalHeight = status === "ready" ? 30 : 15; // percentage
+  const terminalHeight = consoleSize === "expanded" ? "50%" : "clamp(80px, 25%, 150px)";
+
+  function onPreviewLoad() {
+    if (!bridgeInstalledRef.current) return;
+    if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
+    if (bridgeReadyRef.current > bridgeLastLoadRef.current) {
+      bridgeLastLoadRef.current = bridgeReadyRef.current;
+      bridgeTimerRef.current = null;
+      return;
+    }
+    const previous = bridgeReadyRef.current;
+    bridgeTimerRef.current = setTimeout(() => {
+      bridgeTimerRef.current = null;
+      if (bridgeReadyRef.current === previous && previewUrlRef.current) {
+        terminalWriteRef.current?.("[系统] 预览页面日志未连接，可能被页面安全策略或网络阻止；进程日志不受影响。\r\n");
+      }
+    }, 5000);
+  }
 
   return (
-    <div className="flex h-full flex-col bg-white">
-      <div className="flex h-9 shrink-0 items-center gap-2 border-b border-neutral-200 px-3">
+    <div className="flex h-full min-w-0 flex-col bg-white">
+      <div className="flex min-h-14 shrink-0 flex-wrap items-center gap-2 border-b border-[var(--brand-line)] bg-[var(--brand-paper)] px-3 py-2">
         {/* Preview / Code tab toggle */}
-        <div className="flex rounded border border-neutral-300 p-0.5 text-[13px]">
+        <div className="flex shrink-0 rounded-md border border-[#cbd1c0] bg-white p-0.5">
           {(["preview", "code"] as const).map((candidate) => (
             <button
               key={candidate}
               type="button"
               onClick={() => setView(candidate)}
-              className={`rounded px-2 py-0.5 ${
-                view === candidate ? "bg-blue-600 text-white" : "text-neutral-600 hover:bg-neutral-100"
+              aria-label={candidate === "preview" ? "预览" : "代码"}
+              aria-pressed={view === candidate}
+              title={candidate === "preview" ? "预览" : "代码"}
+              className={`flex h-10 w-10 items-center justify-center rounded ${
+                view === candidate ? "bg-[var(--brand-ink)] text-white" : "text-[var(--brand-muted)] hover:bg-[#eff5d9]"
               }`}
             >
-              {candidate === "preview" ? "预览" : "代码"}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                {candidate === "preview" ? (
+                  <><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M8 21h8M12 18v3" /></>
+                ) : (
+                  <><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16" /></>
+                )}
+              </svg>
             </button>
           ))}
         </div>
         {view === "preview" && (
-          <span className="flex items-center gap-1.5 text-[13px] text-neutral-500">
-            <span className={`h-1.5 w-1.5 rounded-full ${status === "ready" ? "bg-emerald-500" : status === "error" ? "bg-red-500" : status === "stopped" ? "bg-neutral-400" : "animate-pulse bg-amber-500"}`} />
-            {statusLabel[status]}
+          <span role="status" title={statusLabel[status]} className="flex min-w-0 items-center gap-1.5 text-[13px] text-neutral-500">
+            <span aria-hidden="true" className={`h-1.5 w-1.5 shrink-0 rounded-full ${status === "ready" ? "bg-emerald-500" : status === "error" ? "bg-red-500" : status === "stopped" ? "bg-neutral-400" : "animate-pulse bg-amber-500 motion-reduce:animate-none"}`} />
+            <span className="sr-only sm:not-sr-only sm:truncate">{statusLabel[status]}</span>
           </span>
         )}
         {view === "preview" && (
@@ -336,93 +475,90 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
               <button
                 type="button"
                 onClick={stop}
+                aria-label="停止服务"
                 title="停止开发服务器（保留 WebContainer）"
-                className="rounded border border-red-300 px-2 py-0.5 text-[13px] text-red-600 hover:bg-red-50"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-red-300 text-red-600 hover:bg-red-50"
               >
-                停止服务
+                <svg viewBox="0 0 24 24" fill="currentColor" className="h-4 w-4" aria-hidden="true">
+                  <rect x="6" y="6" width="12" height="12" rx="1" />
+                </svg>
               </button>
             )}
             <button
               type="button"
               onClick={refresh}
               disabled={status !== "ready" && status !== "error" && status !== "stopped"}
-              title="重新挂载工作区并重启开发服务器"
-              className="rounded border border-neutral-300 px-2 py-0.5 text-[13px] text-neutral-600 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
+              aria-label={status === "stopped" ? "启动服务" : "重新启动"}
+              title={status === "stopped" ? "启动服务" : "重新挂载工作区并重启开发服务器"}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {status === "stopped" ? "启动服务" : "重新启动"}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                {status === "stopped" ? <path d="m8 5 11 7-11 7z" /> : <><path d="M20 7v5h-5" /><path d="M20 12a8 8 0 1 0-2.3 5.7" /></>}
+              </svg>
             </button>
-            {previewUrl && (
-              <button
-                type="button"
-                onClick={() => {
-                  navigator.clipboard
-                    .writeText(previewUrl)
-                    .then(() => {
-                      setCopiedUrl(true);
-                      window.setTimeout(() => setCopiedUrl(false), 1500);
-                    })
-                    .catch(() => {});
-                }}
-                aria-label={copiedUrl ? "预览链接已复制" : "复制预览链接"}
-                title={copiedUrl ? "已复制预览链接" : "复制预览链接"}
-                className="flex max-w-[16rem] items-center gap-1 truncate rounded border border-neutral-200 bg-neutral-50 px-2 py-0.5 text-[13px] text-neutral-500 hover:bg-neutral-100"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth={2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  className="h-3 w-3 shrink-0"
-                  aria-hidden="true"
-                >
-                  {copiedUrl ? (
-                    <polyline points="20 6 9 17 4 12" />
-                  ) : (
-                    <>
-                      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                    </>
-                  )}
-                </svg>
-                <span className="truncate">{previewUrl}</span>
-              </button>
-            )}
+            <button
+              type="button"
+              onClick={() => setConsoleSize((size) => size === "hidden" ? "compact" : "hidden")}
+              aria-label={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}
+              aria-expanded={consoleSize !== "hidden"}
+              aria-controls="preview-console"
+              title={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9]"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                <rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M12 15h5" />
+              </svg>
+            </button>
           </>
         )}
       </div>
-      {view === "code" ? (
+      {view === "code" && (
         <div className="min-h-0 flex-1">
           {workspaceIdProp ? <CodeEditor workspaceId={workspaceIdProp} /> : null}
         </div>
-      ) : (
-      <div className="relative min-h-0 flex-1">
-        {previewUrl ? <iframe src={previewUrl} title="WebContainer 应用预览" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
-          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-[13px] text-neutral-500">请查看下方终端输出，确认工作区服务正常后重新启动。</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[13px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">开发服务器已停止</p><p className="text-[13px] text-neutral-400">点击“启动服务”即可继续运行，容器和已安装的依赖仍然保留。</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" /><p className="text-sm">{statusLabel[status]}</p><p className="text-[13px] text-neutral-400">正在通过快照加载工作区。</p></>}
+      )}
+      <div className={view === "preview" ? "relative min-h-0 flex-1" : "hidden"}>
+        {previewUrl ? <iframe ref={iframeRef} src={previewUrl} onLoad={onPreviewLoad} title="WebContainer 应用预览" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
+          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-[13px] text-neutral-500">请查看下方终端输出，确认工作区服务正常后重新启动。</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[13px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">开发服务器已停止</p><p className="text-[13px] text-neutral-400">点击“启动服务”即可继续运行，容器和已安装的依赖仍然保留。</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-[var(--brand-purple)]" /><p className="text-sm">{statusLabel[status]}</p><p className="text-[13px] text-neutral-400">正在通过快照加载工作区到本机电脑（第一次可能较慢）。</p></>}
         </div>}
       </div>
-      )}
 
-      {view === "preview" && (
-        <>
-          {/* Visual divider for terminal — fixed, not draggable */}
-          <div
-            role="separator"
-            aria-orientation="horizontal"
-            className="h-1 shrink-0 bg-neutral-300"
-          />
-
-          <div
-            className="flex min-h-0 flex-col border-t border-neutral-300"
-            style={{ height: `${terminalHeight}%` }}
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        className={view === "preview" && consoleSize !== "hidden" ? "h-1 shrink-0 bg-[#e1e7d4]" : "hidden"}
+      />
+      <div
+        id="preview-console"
+        className={view === "preview" && consoleSize !== "hidden" ? "flex min-h-0 shrink-0 flex-col border-t border-[var(--brand-line)]" : "hidden"}
+        style={{ height: terminalHeight, maxHeight: "50%" }}
+      >
+        <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--brand-line)] bg-[#f0f2e9] px-3">
+          <span className="text-[#799b39]" aria-hidden="true">●</span>
+          <span className="text-[13px] font-bold text-[var(--brand-ink)]">终端</span>
+          <button
+            type="button"
+            onClick={() => setConsoleSize((size) => size === "expanded" ? "compact" : "expanded")}
+            aria-label={consoleSize === "expanded" ? "收起终端" : "展开终端"}
+            title={consoleSize === "expanded" ? "收起终端" : "展开终端"}
+            className="ml-auto flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
           >
-            <div className="flex h-9 shrink-0 items-center border-b border-neutral-200 px-3"><span className="text-[13px] font-medium tracking-wide text-neutral-600 uppercase">终端</span></div>
-            <div ref={terminalRef} className="min-h-0 flex-1 bg-white px-2 py-1" />
-          </div>
-        </>
-      )}
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+              {consoleSize === "expanded" ? <path d="m7 10 5 5 5-5" /> : <path d="m7 14 5-5 5 5" />}
+            </svg>
+          </button>
+          <button
+            type="button"
+            onClick={() => setConsoleSize("hidden")}
+            aria-label="隐藏终端"
+            title="隐藏终端"
+            className="flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="h-4 w-4" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+          </button>
+        </div>
+        <div ref={terminalRef} className="min-h-0 flex-1 bg-white px-2 py-1" />
+      </div>
     </div>
   );
 }

@@ -48,7 +48,7 @@ function client(states: object[], env: Record<string, string | undefined> = {}, 
 }
 
 test("service succeeds without public endpoint and reads the referenced bearer key", async () => {
-  const c = client([worker()], { PI_CONNECTION_MODE: "service", PI_NAMESPACE: "agents" });
+  const c = client([worker()], { PI_NAMESPACE: "agents" });
   const handle = await c.ensure();
   assert.equal(handle.endpoint, "ws://pw-project.agents.svc:8080/v1/rpc");
   assert.equal(handle.token, "bearer-token");
@@ -62,7 +62,7 @@ test("service waits separately for Ready, serviceName, and bearer ref without en
     worker({ ...ready, serviceName: undefined, endpoint: "wss://public/v1/rpc" }),
     worker({ ...ready, bearerTokenSecretRef: undefined }),
     worker(),
-  ], { PI_CONNECTION_MODE: "service" });
+  ], {});
   assert.equal((await c.ensure()).endpoint, "ws://pw-project.default.svc:8080/v1/rpc");
   assert.equal(c.gets(), 5);
   assert.equal(c.reads.length, 1);
@@ -70,78 +70,66 @@ test("service waits separately for Ready, serviceName, and bearer ref without en
 
 test("each missing service prerequisite reaches the finite default readiness timeout", async () => {
   for (const status of [{ ...ready, conditions: [] }, { ...ready, serviceName: undefined }, { ...ready, bearerTokenSecretRef: undefined }]) {
-    const c = client([worker(status)], { PI_CONNECTION_MODE: "service" });
+    const c = client([worker(status)], {});
     await assert.rejects(c.ensure(), { code: "RECONCILE_TIMEOUT" });
     assert.ok(c.gets() > 300 && c.gets() < 310);
     assert.equal(c.reads.length, 0);
   }
 });
 
-test("invalid modes and namespaces reject before Kubernetes initialization", async () => {
-  for (const env of [{ PI_CONNECTION_MODE: "ingress" }, { PI_CONNECTION_MODE: "" }, { PI_CONNECTION_MODE: "service", PI_NAMESPACE: "bad.namespace" }]) {
-    const c = client([worker()], env);
-    await assert.rejects(c.ensure(), { code: "BAD_CONFIG" });
-    assert.equal(c.apiCalls(), 0);
-  }
+test("invalid namespaces reject before Kubernetes initialization", async () => {
+  const c = client([worker()], { PI_NAMESPACE: "bad.namespace" });
+  await assert.rejects(c.ensure(), { code: "BAD_CONFIG" });
+  assert.equal(c.apiCalls(), 0);
 });
 
 test("invalid Service labels, unmanaged workers, and missing workspaces are rejected", async () => {
   for (const serviceName of ["bad.name", "UPPER", "-bad", "bad-", "a".repeat(64), "bad:8080"]) {
-    const c = client([worker({ ...ready, serviceName })], { PI_CONNECTION_MODE: "service" });
+    const c = client([worker({ ...ready, serviceName })], {});
     await assert.rejects(c.ensure(), { code: "BAD_CONFIG" });
     assert.equal(c.reads.length, 0);
   }
-  for (const mode of ["service", "endpoint"]) {
-    await assert.rejects(client([worker({ ...ready, endpoint: "wss://public/v1/rpc" }, false)], { PI_CONNECTION_MODE: mode }).ensure(), { code: "BAD_CONFIG" });
-  }
+  await assert.rejects(client([worker({ ...ready, endpoint: "wss://public/v1/rpc" }, false)]).ensure(), { code: "BAD_CONFIG" });
   const missing = client([worker()], {}, false);
   await assert.rejects(missing.ensure(), { code: "UNKNOWN_WORKSPACE" });
   assert.equal(missing.apiCalls(), 0);
 });
 
-test("default and explicit endpoint modes preserve public URL and Secret key fallback", async () => {
-  for (const env of [{}, { PI_CONNECTION_MODE: "endpoint" }]) {
-    const c = client([worker({ ...ready, endpoint: "wss://public:8443/custom?x=1", bearerTokenSecretRef: { name: "bearer" } })], env);
-    const handle = await c.ensure();
-    assert.equal(handle.endpoint, "wss://public:8443/custom?x=1");
-    assert.equal(handle.token, "fallback");
-  }
-  await assert.rejects(client([worker()], { PI_READY_TIMEOUT_MS: "1" }).ensure(), { code: "RECONCILE_TIMEOUT" });
+test("ready service uses the internal URL and Secret key fallback", async () => {
+  const c = client([worker({ ...ready, endpoint: "wss://public:8443/custom?x=1", bearerTokenSecretRef: { name: "bearer" } })]);
+  const handle = await c.ensure();
+  assert.equal(handle.endpoint, "ws://pw-project.default.svc:8080/v1/rpc");
+  assert.equal(handle.token, "fallback");
+  await assert.rejects(client([worker({ ...ready, serviceName: undefined })], { PI_READY_TIMEOUT_MS: "1" }).ensure(), { code: "RECONCILE_TIMEOUT" });
 });
 
-test("ws bypasses configured TLS forward; wss keeps forwarding with hostname-only SNI", async () => {
-  for (const protocol of ["ws", "wss"]) {
-    const sockets: { url: string; options: { createConnection?: () => unknown } }[] = [];
-    const tlsCalls: unknown[] = [];
-    class Socket extends EventEmitter {
-      static OPEN = 1;
-      static CONNECTING = 0;
-      static CLOSED = 3;
-      readyState = 1;
-      constructor(url: string, options: { createConnection?: () => unknown }) {
-        super(); sockets.push({ url, options }); queueMicrotask(() => this.emit("open"));
-      }
-      close() {}
+test("service connection preserves URL and encodes the token", async () => {
+  const sockets: { url: string }[] = [];
+  class Socket extends EventEmitter {
+    static OPEN = 1;
+    static CONNECTING = 0;
+    static CLOSED = 3;
+    readyState = 1;
+    constructor(url: string) {
+      super(); sockets.push({ url }); queueMicrotask(() => this.emit("open"));
     }
-    const endpoint = `${protocol}://agent.test:8080/custom/rpc?keep=a%2Bb&token=old&token=duplicate`;
-    const token = "a +/&?=#中文";
-    const mod = load("session", { PI_INGRESS_FORWARD_HOST: "127.0.0.1", PI_INGRESS_FORWARD_PORT: "8443" }, {
-      "node:crypto": { randomUUID: () => "id" }, "node:tls": { connect: (options: unknown) => { tlsCalls.push(options); } },
-      ws: Socket, "@/app/lib/bridge/k8s": { ensurePiWorker: async () => ({ endpoint, token }), deletePiWorker: async () => {} },
-    }, false);
-    const lease = { clientId: "00000000-0000-4000-8000-000000000001", issuedAt: 0 };
-    await mod.ensureAgentSession("project" as never, lease as never);
-    const url = new URL(sockets[0].url);
-    assert.equal(url.protocol, `${protocol}:`);
-    assert.equal(url.host, "agent.test:8080");
-    assert.equal(url.pathname, "/custom/rpc");
-    assert.equal(url.searchParams.get("keep"), "a+b");
-    assert.deepEqual(url.searchParams.getAll("token"), [token]);
-    if (protocol === "ws") assert.equal(sockets[0].options.createConnection, undefined);
-    else {
-      sockets[0].options.createConnection!();
-      assert.equal(JSON.stringify(tlsCalls), JSON.stringify([{ host: "127.0.0.1", port: 8443, servername: "agent.test", rejectUnauthorized: false }]));
-    }
-    await mod.releaseAgentLease("project" as never, lease as never);
+    close() {}
   }
+  const endpoint = "ws://agent.test:8080/custom/rpc?keep=a%2Bb&token=old&token=duplicate";
+  const token = "a +/&?=#中文";
+  const mod = load("session", {}, {
+    "node:crypto": { randomUUID: () => "id" },
+    "@/app/lib/bridge/runtime": { runtimeMode: () => "prod", BridgeLifecycleError: class extends Error { constructor(public status: number, public code: string, message: string) { super(message); } } },
+    "@/app/lib/bridge/local": { LocalPiTransport: class {} },
+    ws: Socket, "@/app/lib/bridge/k8s": { ensurePiWorker: async () => ({ endpoint, token }), deletePiWorker: async () => {} },
+  }, false);
+  const lease = { clientId: "00000000-0000-4000-8000-000000000001", issuedAt: 0 };
+  await mod.ensureAgentSession("project" as never, lease as never);
+  const url = new URL(sockets[0].url);
+  assert.equal(url.protocol, "ws:");
+  assert.equal(url.host, "agent.test:8080");
+  assert.equal(url.pathname, "/custom/rpc");
+  assert.equal(url.searchParams.get("keep"), "a+b");
+  assert.deepEqual(url.searchParams.getAll("token"), [token]);
+  await mod.releaseAgentLease("project" as never, lease as never);
 });

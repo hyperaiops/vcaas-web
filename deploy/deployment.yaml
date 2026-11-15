@@ -82,7 +82,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: webcontainer
-          image: ccr.ccs.tencentyun.com/vcaas/platform:agent-cleanup-20261025-232243
+          image: ccr.ccs.tencentyun.com/vcaas/platform:release-20261115-163329
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
@@ -99,11 +99,11 @@ spec:
               value: "0.0.0.0"
             - name: PORT
               value: "3000"
-            # Local port-forward debugging only. Disable this flag and use HTTPS for public access.
-            - name: AUTH_ALLOW_HTTP_LOCALHOST
-              value: "true"
+            # Public HTTPS origin; must match the Authing-registered callbacks.
             - name: AUTH_ORIGIN
-              value: http://localhost:3000
+              value: https://vibe-coding.host
+            - name: PI_BRIDGE_ALLOWED_ORIGIN
+              value: https://vibe-coding.host
             - name: AUTH_ISSUER
               value: https://vibe-coding-host.authing.cn/oidc
             - name: AUTH_CLIENT_ID
@@ -133,17 +133,15 @@ spec:
             # Reserved for the separate PVC/subPath integration.
             - name: PI_WORKSPACE_PVC_NAME
               value: my-agent-workspace
-            # Server-to-agent RPC uses the internal ClusterIP Service, not Ingress.
-            - name: PI_CONNECTION_MODE
-              value: service
+            # prod: agent RPC connects to the PiWorker ClusterIP Service.
+            - name: PI_RUNTIME_MODE
+              value: prod
             - name: PI_LITELLM_MODEL
               value: glm-5.3-flash
             - name: PI_READY_TIMEOUT_MS
               value: "300000"
             - name: PI_WS_CONNECT_TIMEOUT_MS
               value: "180000"
-            - name: PI_AGENT_IDLE_TIMEOUT_MS
-              value: "600000"
           envFrom:
             - secretRef:
                 name: webcontainer-env

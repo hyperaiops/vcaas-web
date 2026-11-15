@@ -22,7 +22,7 @@ const WebContainerPreview = dynamic(
   },
 );
 
-export default function WorkspaceEditor({ userName }: { userName: string }) {
+export default function WorkspaceEditor({ userName, canLogout = true }: { userName: string; canLogout?: boolean }) {
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const workspaceId = params?.id ?? null;
@@ -64,19 +64,19 @@ export default function WorkspaceEditor({ userName }: { userName: string }) {
 
   if (!workspaceId || status === "missing") {
     return (
-      <div className="flex h-dvh items-center justify-center text-sm text-neutral-500">
-        未找到工作区。 <Link href="/" className="ml-1 text-blue-600 underline">返回工作区列表</Link>
+      <div className="flex h-dvh items-center justify-center bg-[var(--brand-paper)] text-sm text-[var(--brand-muted)]">
+        未找到工作区。 <Link href="/" className="ml-1 text-[var(--brand-purple)] underline">返回工作区列表</Link>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden">
+    <div className="flex flex-1 flex-col overflow-hidden bg-[var(--brand-paper)] text-[var(--brand-ink)]">
       {/* Title bar */}
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-neutral-300 bg-white px-3">
+      <header className="flex min-h-16 shrink-0 items-center gap-2 border-b border-[var(--brand-line)] px-3 sm:gap-3 sm:px-5">
         <Link
           href="/"
-          className="flex items-center gap-1 rounded px-1.5 py-1 text-[13px] font-medium text-neutral-600 hover:bg-neutral-100"
+          className="flex min-h-9 items-center gap-1 rounded-md border border-transparent px-2 text-[13px] font-medium text-[var(--brand-muted)] hover:border-[#d4d8ca] hover:bg-[#eceee3]"
           title="返回工作区列表"
         >
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden>
@@ -84,28 +84,26 @@ export default function WorkspaceEditor({ userName }: { userName: string }) {
           </svg>
           返回
         </Link>
-        <div className="mx-1 h-4 w-px bg-neutral-300" />
-        <div className="flex h-5 w-5 items-center justify-center rounded bg-blue-600 text-[10px] font-bold text-white">
-          随
-        </div>
-        <span className="text-[13px] font-medium text-neutral-800">随心一码</span>
-        <span className="hidden text-[13px] text-neutral-400 md:inline">— 在线开发环境</span>
-        <span className="ml-auto hidden max-w-[12rem] truncate font-mono text-[13px] text-neutral-400 md:inline" title={workspaceId}>
+        <div className="h-6 w-px bg-[var(--brand-line)]" />
+        <span className="brand-mark" aria-hidden="true">{'</>'}</span>
+        <span className="whitespace-nowrap text-base font-extrabold tracking-tight sm:text-lg">随心一码<span className="text-[var(--brand-purple)]">.</span></span>
+        <span className="hidden text-[13px] text-[var(--brand-muted)] md:inline">创作空间</span>
+        <span className="ml-auto hidden max-w-[12rem] truncate font-mono text-[13px] text-[#858b7d] lg:inline" title={workspaceId}>
           {workspaceId}
         </span>
-        <UserMenu name={userName} />
+        <UserMenu name={userName} canLogout={canLogout} />
       </header>
 
       {status === "loading" ? (
         <div className="flex flex-1 items-center justify-center text-sm text-neutral-400">
-          <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-neutral-300 border-t-blue-600" />
+          <div className="mr-2 h-4 w-4 animate-spin rounded-full border-2 border-[#d9dccf] border-t-[var(--brand-purple)] motion-reduce:animate-none" />
           正在加载工作区…
         </div>
       ) : (
-        /* Fixed layout: 1/3 chat (left), 2/3 preview (right); stacked on mobile */
+        /* Desktop: 1/3 chat and 2/3 preview; mobile: equal stacked panels. */
         <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
           <section
-            className="min-h-[40dvh] lg:min-h-0"
+            className="min-h-0 min-w-0 flex-1 overflow-hidden lg:flex-none"
             style={isDesktop ? { width: "33.33%" } : undefined}
           >
             <AgentPanel workspaceId={workspaceId} />
@@ -115,10 +113,10 @@ export default function WorkspaceEditor({ userName }: { userName: string }) {
           <div
             role="separator"
             aria-orientation="vertical"
-            className="hidden w-1 shrink-0 bg-neutral-300 lg:block"
+            className="hidden w-1 shrink-0 bg-[#e1e7d4] lg:block"
           />
 
-          <section className="min-h-0 flex-1 border-t border-neutral-300 lg:border-t-0">
+          <section className="min-h-0 min-w-0 flex-1 border-t border-[var(--brand-line)] lg:border-t-0">
             <WebContainerPreview workspaceId={workspaceId} />
           </section>
         </div>

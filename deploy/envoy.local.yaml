@@ -1,0 +1,62 @@
+static_resources:
+  listeners:
+    - name: local_https
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8443
+      filter_chains:
+        - transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                  - certificate_chain:
+                      filename: /etc/envoy/tls/tls.crt
+                    private_key:
+                      filename: /etc/envoy/tls/tls.key
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: local_https
+                use_remote_address: true
+                stream_idle_timeout: 0s
+                upgrade_configs:
+                  - upgrade_type: websocket
+                route_config:
+                  name: local_app
+                  request_headers_to_remove: ["x-forwarded-host", "x-forwarded-port"]
+                  request_headers_to_add:
+                    - header:
+                        key: x-forwarded-proto
+                        value: https
+                      append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                  virtual_hosts:
+                    - name: vibe_coding
+                      domains: ["vibe-coding.host", "vibe-coding.host:*"]
+                      routes:
+                        - match:
+                            prefix: /
+                          route:
+                            cluster: local_next
+                            timeout: 0s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: local_next
+      type: STRICT_DNS
+      dns_lookup_family: V4_ONLY
+      connect_timeout: 5s
+      load_assignment:
+        cluster_name: local_next
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: host.docker.internal
+                      port_value: 3000

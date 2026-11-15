@@ -1,8 +1,15 @@
 @import "tailwindcss";
 
 :root {
-  --background: #f3f3f3;
-  --foreground: #1f1f1f;
+  --background: #fafbf5;
+  --foreground: #20211e;
+  --brand-ink: #20211e;
+  --brand-muted: #66685f;
+  --brand-paper: #fafbf5;
+  --brand-lime: #d4fa73;
+  --brand-purple: #7160d6;
+  --brand-line: #d9dccf;
+  --brand-soft: #f0f2e9;
   --font-chinese-ui: "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
   --font-code: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", "PingFang SC", "Microsoft YaHei", monospace;
   --font-sans: var(--font-chinese-ui);
@@ -24,4 +31,47 @@ body {
   font-kerning: normal;
   line-break: strict;
   overflow-wrap: break-word;
+}
+
+:where(a, button, input, textarea, select):focus-visible {
+  outline: 3px solid var(--brand-purple);
+  outline-offset: 3px;
+}
+
+.brand-mark {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding-right: 0.25rem;
+  border-radius: 0.65rem;
+  background: var(--brand-ink);
+  color: var(--brand-lime);
+  font: 700 1.1rem var(--font-code);
+  letter-spacing: -0.2em;
+}
+
+.brand-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  border: 1px solid var(--brand-ink);
+  border-radius: 0.45rem;
+  background: var(--brand-ink);
+  color: #fff;
+  font-weight: 700;
+  box-shadow: 3px 3px 0 var(--brand-lime);
+  transition: transform 150ms, box-shadow 150ms;
+}
+.brand-button:not(:disabled):hover {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--brand-lime);
+}
+.brand-button:disabled { cursor: not-allowed; opacity: 0.5; box-shadow: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .brand-button { transition: none; }
+  .brand-button:not(:disabled):hover { transform: none; }
 }

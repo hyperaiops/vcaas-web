@@ -12,6 +12,6 @@
 **/out
 **/*.tsbuildinfo
 *.log
-deployment.yaml
+deploy/deployment.yaml
 public/monaco
 public/.monaco-stage-*

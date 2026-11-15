@@ -3,9 +3,8 @@
 // Each workspace maps 1:1 to a `PiWorker` (ubi.pi.dev/v1alpha1) custom resource,
 // named after the workspace id. Entering a workspace creates/ensures the CR;
 // the PiWorker operator reconciles it into a Deployment + Service + Ingress +
-// auto-generated bearer-token Secret and writes the public `wss://.../v1/rpc`
-// endpoint into `.status.endpoint`. Service mode connects to `.status.serviceName`
-// instead, bypassing Ingress for RPC traffic. Leaving deletes the CR; the operator's
+// auto-generated bearer-token Secret. This application always connects RPC to
+// `.status.serviceName` and never uses the ingress endpoint. Leaving deletes the CR; the operator's
 // ownerRef + finalizer garbage-collects the child resources (including the
 // LiteLLM key Secret, which the controller now owns and creates from
 // `spec.litellm.apiKey`).
@@ -34,12 +33,10 @@ const NAMESPACE = process.env.PI_NAMESPACE ?? "default";
 const LITELLM_API_KEY = process.env.PI_LITELLM_API_KEY ?? "";
 const LITELLM_BASE_URL = process.env.PI_LITELLM_BASE_URL ?? "";
 const LITELLM_MODEL = process.env.PI_LITELLM_MODEL ?? "gpt-4.1";
-const INGRESS_CLASS = process.env.PI_INGRESS_CLASS ?? "";
-const INGRESS_TLS_SECRET = process.env.PI_INGRESS_TLS_SECRET ?? "";
 const ALLOWED_ORIGIN = process.env.PI_BRIDGE_ALLOWED_ORIGIN ?? "";
 
 const READY_POLL_INTERVAL_MS = 1000;
-const READY_TIMEOUT_MS = Number(process.env.PI_READY_TIMEOUT_MS ?? "300000"); // 5 min: ingress + pod spin-up can take a while.
+const READY_TIMEOUT_MS = Number(process.env.PI_READY_TIMEOUT_MS ?? "300000"); // 5 min: agent pod startup can take a while.
 
 export type AgentHandle = {
   endpoint: string; // selected ws:// Service or public wss:// endpoint
@@ -101,11 +98,7 @@ export async function ensurePiWorker(workspaceId: string, signal?: AbortSignal):
     );
   }
 
-  const mode = process.env.PI_CONNECTION_MODE ?? "endpoint";
-  if (mode !== "endpoint" && mode !== "service") {
-    throw new K8sClientError("BAD_CONFIG", "PI_CONNECTION_MODE must be endpoint or service.");
-  }
-  if (mode === "service") assertDnsLabel(NAMESPACE, "PI_NAMESPACE");
+  assertDnsLabel(NAMESPACE, "PI_NAMESPACE");
 
   const { custom, core } = apis();
 
@@ -143,10 +136,8 @@ export async function ensurePiWorker(workspaceId: string, signal?: AbortSignal):
       continue;
     }
     const serviceName = pw?.status?.serviceName;
-    if (mode === "service" && serviceName) assertDnsLabel(serviceName, "PiWorker serviceName");
-    endpoint = mode === "service"
-      ? serviceName ? `ws://${serviceName}.${NAMESPACE}.svc:8080/v1/rpc` : undefined
-      : pw?.status?.endpoint;
+    if (serviceName) assertDnsLabel(serviceName, "PiWorker serviceName");
+    endpoint = serviceName ? `ws://${serviceName}.${NAMESPACE}.svc:8080/v1/rpc` : undefined;
     if (pw && isReady(pw) && endpoint && pw.status?.bearerTokenSecretRef?.name) break;
     if (Date.now() > deadline) {
       throw new K8sClientError(
@@ -206,11 +197,6 @@ async function createPiWorker(custom: k8s.CustomObjectsApi, workspaceId: string)
     },
     auth: { allowedOrigins: ALLOWED_ORIGIN ? [ALLOWED_ORIGIN] : [] },
   };
-  const ingress: Record<string, unknown> = {};
-  if (INGRESS_CLASS) ingress.className = INGRESS_CLASS;
-  if (INGRESS_TLS_SECRET) ingress.tlsSecretName = INGRESS_TLS_SECRET;
-  if (Object.keys(ingress).length) spec.ingress = ingress;
-
   const body = {
     apiVersion: `${GROUP}/${VERSION}`,
     kind: "PiWorker",

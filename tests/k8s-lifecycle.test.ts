@@ -41,7 +41,7 @@ function load(options: { states?: (object | null)[]; create?: () => Promise<void
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const exports = {} as { ensurePiWorker(id: string, signal?: AbortSignal): Promise<{ endpoint: string }>; deletePiWorker(id: string): Promise<void> };
   runInNewContext(code, {
-    exports, Buffer, process: { env: { PI_LITELLM_API_KEY: "key", PI_LITELLM_BASE_URL: "http://llm", PI_CONNECTION_MODE: "service", PI_READY_TIMEOUT_MS: "2000" } },
+    exports, Buffer, process: { env: { PI_LITELLM_API_KEY: "key", PI_LITELLM_BASE_URL: "http://llm", PI_READY_TIMEOUT_MS: "2000" } },
     Date: { now: () => now },
     setTimeout: options.realTimers ? setTimeout : (fn: () => void, ms: number) => { now += ms; queueMicrotask(() => { options.onSleep?.(); fn(); }); return 1; },
     clearTimeout,

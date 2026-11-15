@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 
-function inspect(origin: string, mode: "development" | "production" | "test", issuer = "https://identity.test/oidc", allowHttpLocalhost = false) {
+function inspect(origin: string | undefined, mode: "development" | "production" | "test", issuer = "https://identity.test/oidc", allowHttpLocalhost = false, runtime = "prod") {
   const result = spawnSync(process.execPath, [
     "--conditions=react-server", "--import", "tsx", "--input-type=module", "-e",
     `import { authConfig, cookieOptions, SESSION_COOKIE } from './app/lib/auth/config.ts';
@@ -12,13 +12,21 @@ function inspect(origin: string, mode: "development" | "production" | "test", is
      } catch { console.log(JSON.stringify({ allowed: false })); }`,
   ], {
     encoding: "utf8",
-    env: { ...process.env, NODE_ENV: mode, AUTH_ORIGIN: origin, AUTH_ISSUER: issuer,
+    env: { ...process.env, NODE_ENV: mode, PI_RUNTIME_MODE: runtime, AUTH_ORIGIN: origin, AUTH_ISSUER: issuer,
       AUTH_ALLOW_HTTP_LOCALHOST: String(allowHttpLocalhost),
       AUTH_CLIENT_SECRET: "test-only", AUTH_SESSION_KEY: "12".repeat(32) },
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
+
+test("local agent mode uses the public HTTPS origin and secure cookies by default", () => {
+  const result = inspect(undefined, "development", "https://identity.test/oidc", false, "local");
+  assert.equal(result.allowed, true);
+  assert.equal(result.callback, "https://vibe-coding.host/auth/callback");
+  assert.equal(result.secure, true);
+  assert.equal(result.cookie, "__Host-pi-session");
+});
 
 test("local HTTP development uses a localhost callback and non-Host cookies", () => {
   const result = inspect("http://localhost:3000", "development");

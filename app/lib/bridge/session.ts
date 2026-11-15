@@ -1,25 +1,43 @@
-// Single-process workspace lifecycle. Leases are registered before any Kubernetes
-// operation; shutdown fences the generation synchronously, then drains it before delete.
+// Single-process workspace lifecycle. Leases are registered before any agent
+// operation; shutdown fences the generation synchronously, then drains it before
+// teardown. The transport depends on PI_RUNTIME_MODE:
+//   prod  — WebSocket to the workspace PiWorker over the in-cluster Service.
+//   local — spawned local `pi --mode rpc` process (development only).
 import "server-only";
 import { randomUUID } from "node:crypto";
-import tls from "node:tls";
 import WebSocket from "ws";
 import { ensurePiWorker, deletePiWorker } from "@/app/lib/bridge/k8s";
+import { LocalPiTransport } from "@/app/lib/bridge/local";
+import { runtimeMode, BridgeLifecycleError } from "@/app/lib/bridge/runtime";
+
+export { BridgeLifecycleError };
 
 const GRACE_MS = 30_000;
 const FRESH_MS = 300_000;
 const TOMBSTONE_MS = 900_000; // exceeds the full accepted issuedAt window, including skew
 const CAPACITY = 10_000;
-const FORWARD_HOST = process.env.PI_INGRESS_FORWARD_HOST ?? "";
-const FORWARD_PORT = Number(process.env.PI_INGRESS_FORWARD_PORT ?? "0");
 const CONNECT_MS = Number(process.env.PI_WS_CONNECT_TIMEOUT_MS ?? "180000");
 export type AgentConnect = { endpoint: string; token: string };
 export type AgentLease = { clientId: string; issuedAt: number };
-export class BridgeLifecycleError extends Error {
-  constructor(public status: number, public code: string, message: string) { super(message); }
-}
+
+type Transport =
+  | { kind: "ws"; socket: WebSocket }
+  | { kind: "local"; pi: LocalPiTransport };
+
 type Lease = { issuedAt: number; released: boolean; expires: number; subscribers: Set<(frame: string) => void>; timer?: ReturnType<typeof setTimeout> };
-type Generation = { controller: AbortController; connecting: Promise<AgentConnect> | null; ws: WebSocket | null; handle: AgentConnect | null; busy: boolean; outbound: string[] };
+type TurnPhase = "running" | "retrying" | "compacting" | "stopping" | "uncertain" | "done" | "stopped" | "failed";
+type Activity = { id: string; name: string; status: "running" | "done" | "failed" };
+type Turn = {
+  id: string; clientId: string; promptId: string; phase: TurnPhase; text: string; activities: Activity[];
+  truncated: boolean; sent: boolean; accepted: boolean; started: boolean; settled: boolean;
+  cancelRequested: boolean; aborted: boolean; failed: boolean; pendingAborts: Set<string>; epoch: number; abortEpoch: number;
+  timer?: ReturnType<typeof setTimeout>;
+};
+type Generation = {
+  controller: AbortController; connecting: Promise<AgentConnect> | null; transport: Transport | null;
+  handle: AgentConnect | null; busy: boolean; turn: Turn | null; sequence: number;
+  cancelled: Map<string, number>; completed: Map<string, Turn>; recent: Map<string, number>;
+};
 type Workspace = { leases: Map<string, Lease>; generation: Generation | null; cleanup: Promise<void> | null; dirty: boolean; fenced: boolean; retry?: ReturnType<typeof setTimeout> };
 const workspaces = new Map<string, Workspace>();
 function error(status: number, code: string, message: string): never { throw new BridgeLifecycleError(status, code, message); }
@@ -69,15 +87,31 @@ function release(w: Workspace, l: Lease) {
   if (l.timer) clearTimeout(l.timer);
   l.timer = undefined; l.subscribers.clear();
 }
+function teardownTransport(t: Transport | null): Promise<void> {
+  if (!t) return Promise.resolve();
+  if (t.kind === "ws") {
+    t.socket.close();
+    return Promise.resolve();
+  }
+  return t.pi.terminate();
+}
+async function teardown(id: string): Promise<void> {
+  if (runtimeMode() === "prod") await deletePiWorker(id);
+}
 function shutdown(id: string, w: Workspace): Promise<void> {
   if (w.cleanup) return w.cleanup;
   if (w.retry) { clearTimeout(w.retry); w.retry = undefined; }
   const g = w.generation;
   w.generation = null; w.dirty = true;
-  if (g) { g.controller.abort(); g.busy = false; g.ws?.close(); }
+  if (g) {
+    g.controller.abort();
+    if (g.turn) clearTurnTimer(g.turn);
+    g.busy = false;
+    void teardownTransport(g.transport);
+  }
   const operation = (async () => {
     await g?.connecting?.catch(() => {});
-    await deletePiWorker(id);
+    await teardown(id);
     w.dirty = false;
   })();
   w.cleanup = operation;
@@ -95,6 +129,7 @@ function shutdown(id: string, w: Workspace): Promise<void> {
 }
 export async function ensureAgentSession(id: string, input: AgentLease): Promise<AgentConnect> {
   validate(input);
+  runtimeMode(); // fail fast on invalid/forbidden configuration, before any state changes
   const w = workspace(id);
   let l = w.leases.get(input.clientId);
   if (l?.released || w.fenced) error(410, "LEASE_RELEASED", "Lease was released");
@@ -117,7 +152,7 @@ export async function ensureAgentSession(id: string, input: AgentLease): Promise
   }
   live(w, input.clientId);
   if (w.dirty) { release(w, l); error(503, "CLEANUP_PENDING", "Agent cleanup must succeed before starting"); }
-  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, ws: null, handle: null, busy: false, outbound: [] };
+  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, transport: null, handle: null, busy: false, turn: null, sequence: 0, cancelled: new Map(), completed: new Map(), recent: new Map() };
   try {
     const handle = await connect(id, w, w.generation);
     live(w, input.clientId);
@@ -150,25 +185,172 @@ export async function forceShutdown(id: string): Promise<void> {
   for (const l of w.leases.values()) release(w, l);
   await shutdown(id, w);
 }
-export async function sendPrompt(id: string, clientId: string, message: string): Promise<void> {
+function snapshot(g: Generation, clientId: string): string {
+  const t = g.turn?.clientId === clientId ? g.turn : g.completed.get(clientId);
+  return JSON.stringify({
+    type: "turn_snapshot", version: 1, sequence: g.sequence, busy: g.busy,
+    ...(t ? { turn: { id: t.id, text: t.text, phase: t.phase, activities: t.activities, truncated: t.truncated } } : {}),
+  });
+}
+function publishSnapshot(w: Workspace, g: Generation) {
+  g.sequence++;
+  for (const [clientId, lease] of w.leases) {
+    if (!lease.released) for (const send of lease.subscribers) send(snapshot(g, clientId));
+  }
+}
+function publishTurn(w: Workspace, g: Generation, t: Turn, event: object) {
+  if (g.turn !== t) return;
+  const frame = JSON.stringify({ type: "turn_event", version: 1, sequence: ++g.sequence, turnId: t.id, event });
+  const lease = w.leases.get(t.clientId);
+  if (lease && !lease.released) for (const send of lease.subscribers) send(frame);
+}
+function setPhase(w: Workspace, g: Generation, t: Turn, phase: TurnPhase) {
+  if (g.turn !== t || t.phase === phase) return;
+  t.phase = phase;
+  publishTurn(w, g, t, { kind: "phase", phase });
+}
+function clearTurnTimer(t: Turn) {
+  if (t.timer) clearTimeout(t.timer);
+  t.timer = undefined;
+}
+function markUncertain(w: Workspace, g: Generation, t: Turn) {
+  if (g.turn !== t || !g.busy) return;
+  clearTurnTimer(t);
+  setPhase(w, g, t, "uncertain");
+}
+function watchTurn(w: Workspace, g: Generation, t: Turn) {
+  clearTurnTimer(t);
+  t.timer = setTimeout(() => markUncertain(w, g, t), 30_000);
+  t.timer.unref?.();
+}
+function rememberTurn(g: Generation, t: Turn) {
+  g.completed.delete(t.clientId);
+  g.completed.set(t.clientId, t);
+  if (g.completed.size > 8) g.completed.delete(g.completed.keys().next().value!);
+  for (const [key, expiry] of g.recent) if (expiry <= Date.now()) g.recent.delete(key);
+  g.recent.set(`${t.clientId}:${t.id}`, Date.now() + TOMBSTONE_MS);
+  if (g.recent.size > 256) g.recent.delete(g.recent.keys().next().value!);
+}
+function finishTurn(w: Workspace, g: Generation, t: Turn) {
+  if (g.turn !== t || !g.busy || !t.settled || t.pendingAborts.size) return;
+  clearTurnTimer(t);
+  t.phase = t.aborted ? "stopped" : t.failed ? "failed" : "done";
+  g.busy = false;
+  rememberTurn(g, t);
+  publishSnapshot(w, g);
+}
+function sendFrame(w: Workspace, g: Generation, t: Turn, value: object) {
+  const transport = g.transport;
+  if (!transport) throw new BridgeLifecycleError(503, "AGENT_CLOSED", "Agent is not connected");
+  const frame = JSON.stringify(value);
+  if (transport.kind === "ws") {
+    transport.socket.send(frame, err => {
+      if (err && current(w, g) && g.transport === transport && g.turn === t) markUncertain(w, g, t);
+    });
+  } else {
+    transport.pi.send(frame);
+  }
+}
+function requestAbort(w: Workspace, g: Generation, t: Turn) {
+  if (!g.busy || g.turn !== t || t.settled || t.pendingAborts.size || !(t.accepted || t.started)) return;
+  const id = `abort-${randomUUID()}`;
+  t.abortEpoch = t.epoch;
+  t.pendingAborts.add(id);
+  try {
+    sendFrame(w, g, t, { id, type: "abort" });
+    watchTurn(w, g, t);
+  } catch {
+    t.pendingAborts.delete(id);
+    markUncertain(w, g, t);
+  }
+}
+function newTurn(clientId: string, turnId: string): Turn {
+  return {
+    id: turnId, clientId, promptId: `req-${randomUUID()}`, phase: "running", text: "", activities: [],
+    truncated: false, sent: false, accepted: false, started: false, settled: false,
+    cancelRequested: false, aborted: false, failed: false, pendingAborts: new Set(), epoch: 0, abortEpoch: 0,
+  };
+}
+export async function sendPrompt(id: string, clientId: string, message: string, turnId: string = randomUUID()): Promise<void> {
   const w = workspaces.get(id);
   if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
   live(w, clientId);
   const g = w.generation;
   if (!g) error(410, "LEASE_RELEASED", "Agent was released");
-  await connect(id, w, g);
-  live(w, clientId); check(w, g);
+  if (g.turn?.id === turnId && g.turn.clientId === clientId) return;
+  const recentKey = `${clientId}:${turnId}`;
+  const recentExpiry = g.recent.get(recentKey);
+  if (recentExpiry && recentExpiry > Date.now()) return;
+  if (recentExpiry) g.recent.delete(recentKey);
+  if (g.busy) error(409, "AGENT_BUSY", "Agent is already processing a request");
+  const t = newTurn(clientId, turnId);
+  g.completed.delete(clientId);
+  g.turn = t;
   g.busy = true;
-  const socket = g.ws!;
-  try { socket.send(JSON.stringify({ id: `req-${randomUUID()}`, type: "prompt", message }), err => { if (err && current(w, g) && g.ws === socket) g.busy = false; }); }
-  catch (err) { g.busy = false; throw err; }
+  publishSnapshot(w, g);
+  const key = `${clientId}:${turnId}`;
+  const expiry = g.cancelled.get(key);
+  g.cancelled.delete(key);
+  if (expiry && expiry > Date.now()) {
+    t.cancelRequested = true; t.aborted = true; t.settled = true;
+    finishTurn(w, g, t);
+    return;
+  }
+  try {
+    await connect(id, w, g);
+    live(w, clientId); check(w, g);
+    if (g.turn !== t || !g.busy) return;
+    if (t.cancelRequested) {
+      t.aborted = true; t.settled = true;
+      finishTurn(w, g, t);
+      return;
+    }
+    t.sent = true;
+    sendFrame(w, g, t, { id: t.promptId, type: "prompt", message });
+    watchTurn(w, g, t);
+  } catch (err) {
+    if (current(w, g) && g.turn === t && g.busy) {
+      if (t.sent) markUncertain(w, g, t);
+      else { t.failed = true; t.settled = true; finishTurn(w, g, t); }
+    }
+    throw err;
+  }
+}
+export async function cancelTurn(id: string, clientId: string, turnId: string): Promise<void> {
+  const w = workspaces.get(id);
+  if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
+  live(w, clientId);
+  const g = w.generation;
+  if (!g) error(410, "LEASE_RELEASED", "Agent was released");
+  const t = g.turn;
+  if (!t || t.id !== turnId) {
+    if ((g.recent.get(`${clientId}:${turnId}`) ?? 0) > Date.now()) return;
+    if (g.busy) error(409, "AGENT_BUSY", "Another request is active");
+    for (const [key, expiry] of g.cancelled) if (expiry <= Date.now()) g.cancelled.delete(key);
+    if (g.cancelled.size >= 256) error(503, "AGENT_CAPACITY", "Too many pending cancellation requests");
+    g.cancelled.set(`${clientId}:${turnId}`, Date.now() + FRESH_MS);
+    const stopped = newTurn(clientId, turnId);
+    stopped.cancelRequested = true; stopped.aborted = true; stopped.settled = true; stopped.phase = "stopped";
+    g.turn = stopped;
+    rememberTurn(g, stopped);
+    publishSnapshot(w, g);
+    return;
+  }
+  if (t.clientId !== clientId) error(403, "TURN_NOT_OWNED", "The request belongs to another page");
+  if (!g.busy) return;
+  if (t.phase === "uncertain") error(503, "AGENT_STATE_UNKNOWN", "Agent state is unknown");
+  if (t.cancelRequested) return;
+  t.cancelRequested = true;
+  setPhase(w, g, t, "stopping");
+  if (!t.sent) { t.aborted = true; t.settled = true; finishTurn(w, g, t); return; }
+  requestAbort(w, g, t);
 }
 export function subscribe(id: string, clientId: string, onFrame: (frame: string) => void): (() => void) | null {
   const w = workspaces.get(id), l = w?.leases.get(clientId);
   if (!w || !l || l.released || w.fenced || !w.generation) return null;
   if (l.timer) clearTimeout(l.timer);
   l.timer = undefined; l.subscribers.add(onFrame);
-  for (const frame of w.generation.outbound) onFrame(frame);
+  onFrame(snapshot(w.generation, clientId));
   return () => { l.subscribers.delete(onFrame); arm(id, w, clientId, l); };
 }
 function pause(ms: number, signal: AbortSignal): Promise<void> {
@@ -179,19 +361,29 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
     if (signal.aborted) abort();
   });
 }
+function isConnected(g: Generation): boolean {
+  if (!g.handle || !g.transport) return false;
+  return g.transport.kind === "ws" ? g.transport.socket.readyState === WebSocket.OPEN : true;
+}
 function connect(id: string, w: Workspace, g: Generation): Promise<AgentConnect> {
   check(w, g);
   if (g.connecting) return g.connecting;
-  if (g.ws?.readyState === WebSocket.OPEN && g.handle) return Promise.resolve(g.handle);
+  if (isConnected(g)) return Promise.resolve(g.handle!);
   const task = (async () => {
+    const mode = runtimeMode();
     const deadline = Date.now() + CONNECT_MS;
     let attempt = 0;
     while (true) {
       check(w, g);
       try {
-        const handle = await ensurePiWorker(id, g.controller.signal);
-        check(w, g);
-        await open(id, w, g, handle);
+        if (mode === "prod") {
+          const handle = await ensurePiWorker(id, g.controller.signal);
+          check(w, g);
+          await openWebSocket(id, w, g, handle);
+          check(w, g); g.handle = handle;
+          return handle;
+        }
+        const handle = await openLocal(id, w, g);
         check(w, g); g.handle = handle;
         return handle;
       } catch (err) {
@@ -205,19 +397,131 @@ function connect(id: string, w: Workspace, g: Generation): Promise<AgentConnect>
   void task.then(() => { if (g.connecting === task) g.connecting = null; }, () => { if (g.connecting === task) g.connecting = null; });
   return task;
 }
-function open(id: string, w: Workspace, g: Generation, handle: AgentConnect): Promise<void> {
+
+/** Normalize Pi events before exposing them to the owner of the active turn. */
+function deliver(w: Workspace, g: Generation, frame: string): void {
+  const t = g.turn;
+  if (!t || !g.busy || !t.sent) return;
+  let event: Record<string, unknown>;
+  try { event = JSON.parse(frame) as Record<string, unknown>; } catch { return; }
+  if (!event || typeof event !== "object") return;
+  if (event.type === "response" && event.command === "prompt" && event.id === t.promptId) {
+    if (event.success !== true) {
+      t.failed = true; t.settled = true;
+      finishTurn(w, g, t);
+    } else {
+      t.accepted = true;
+      if (!t.started) watchTurn(w, g, t);
+      else if (!t.pendingAborts.size) clearTurnTimer(t);
+      if (t.phase === "uncertain") setPhase(w, g, t, t.cancelRequested ? "stopping" : "running");
+      if (t.cancelRequested) requestAbort(w, g, t);
+    }
+    return;
+  }
+  if (event.type === "response" && event.command === "abort" && typeof event.id === "string" && t.pendingAborts.has(event.id)) {
+    t.pendingAborts.delete(event.id);
+    clearTurnTimer(t);
+    if (event.success !== true && !t.settled) markUncertain(w, g, t);
+    else if (!t.settled && t.cancelRequested && t.epoch > t.abortEpoch) requestAbort(w, g, t);
+    else if (!t.settled) watchTurn(w, g, t);
+    finishTurn(w, g, t);
+    return;
+  }
+  if (event.type === "agent_start") {
+    t.started = true;
+    t.epoch++;
+    if (!t.pendingAborts.size) clearTurnTimer(t);
+    setPhase(w, g, t, t.cancelRequested ? "stopping" : "running");
+    if (t.cancelRequested) requestAbort(w, g, t);
+    return;
+  }
+  if (event.type === "agent_settled") {
+    t.settled = true;
+    finishTurn(w, g, t);
+    return;
+  }
+  if (event.type === "message_end" || event.type === "turn_end") {
+    const message = event.message as { stopReason?: unknown } | undefined;
+    if (message?.stopReason === "aborted") t.aborted = true;
+    if (message?.stopReason === "error") t.failed = true;
+  }
+  if (event.type === "auto_retry_start" || event.type === "compaction_start") {
+    if (!t.pendingAborts.size) clearTurnTimer(t);
+    if (event.type === "auto_retry_start") t.epoch++;
+    if (!t.cancelRequested) setPhase(w, g, t, event.type === "auto_retry_start" ? "retrying" : "compacting");
+    if (t.cancelRequested && event.type === "auto_retry_start") requestAbort(w, g, t);
+    return;
+  }
+  if (event.type === "auto_retry_end" || event.type === "compaction_end") {
+    if (event.type === "compaction_end") t.epoch++;
+    if (event.aborted === true) t.aborted = true;
+    if (event.type === "auto_retry_end" && typeof event.success === "boolean") t.failed = !event.success;
+    if (event.type === "compaction_end" && typeof event.errorMessage === "string" && event.aborted !== true) t.failed = true;
+    if (!t.cancelRequested) setPhase(w, g, t, "running");
+    else requestAbort(w, g, t);
+    return;
+  }
+  if (event.type === "agent_end") {
+    if (event.willRetry === true && !t.cancelRequested) setPhase(w, g, t, "retrying");
+    watchTurn(w, g, t);
+    return;
+  }
+  if (event.type === "message_update") {
+    const update = event.assistantMessageEvent as { type?: unknown; delta?: unknown } | undefined;
+    if (update?.type !== "text_delta" || typeof update.delta !== "string") return;
+    const available = Math.max(0, 262_144 - t.text.length);
+    const delta = update.delta.slice(0, available);
+    if (delta) { t.text += delta; publishTurn(w, g, t, { kind: "text", delta }); }
+    if (delta.length !== update.delta.length) t.truncated = true;
+    return;
+  }
+  if (event.type === "tool_execution_start" || event.type === "tool_execution_update" || event.type === "tool_execution_end") {
+    const toolCallId = event.toolCallId;
+    if (typeof toolCallId !== "string" || toolCallId.length > 200) return;
+    const index = t.activities.findIndex((activity) => activity.id === toolCallId);
+    if (index < 0 && event.type !== "tool_execution_start") return;
+    if (index < 0 && t.activities.length >= 100) { t.truncated = true; return; }
+    const name = typeof event.toolName === "string" && ["read", "write", "edit", "bash", "grep", "find", "ls"].includes(event.toolName)
+      ? event.toolName : "other";
+    const activity: Activity = {
+      id: toolCallId,
+      name: index < 0 ? name : t.activities[index].name,
+      status: event.type === "tool_execution_end" ? event.isError === true ? "failed" : "done" : "running",
+    };
+    if (index < 0) t.activities.push(activity); else t.activities[index] = activity;
+    publishTurn(w, g, t, { kind: "activity", activity });
+  }
+}
+
+async function openLocal(id: string, w: Workspace, g: Generation): Promise<AgentConnect> {
+  const pi = await LocalPiTransport.spawn(id, g.controller.signal);
+  const transport: Transport = { kind: "local", pi };
+  g.transport = transport;
+  pi.onMessage(frame => { if (current(w, g) && g.transport === transport) deliver(w, g, frame); });
+  pi.onStderr(line => console.error(`[agent:${id}] ${line}`));
+  pi.onClose(() => {
+    if (!current(w, g) || g.transport !== transport) return;
+    g.transport = null;
+    if (g.turn && g.busy) markUncertain(w, g, g.turn);
+    if ([...w.leases.values()].some(l => !l.released && l.subscribers.size)) {
+      void Promise.resolve().then(() => { if (current(w, g)) return connect(id, w, g); }).catch(() => {});
+    }
+  });
+  return { endpoint: "local:pi", token: "" };
+}
+
+function openWebSocket(id: string, w: Workspace, g: Generation, handle: AgentConnect): Promise<void> {
   return new Promise((resolve, reject) => {
     const url = new URL(handle.endpoint); url.searchParams.set("token", handle.token);
-    const options: WebSocket.ClientOptions = FORWARD_HOST && FORWARD_PORT > 0 && url.protocol === "wss:" ? {
-      createConnection: () => tls.connect({ host: FORWARD_HOST, port: FORWARD_PORT, servername: url.hostname, rejectUnauthorized: false }),
-    } : {};
-    const ws = new WebSocket(url.toString(), options); g.ws = ws;
+    const ws = new WebSocket(url.toString());
+    const transport: Transport = { kind: "ws", socket: ws };
+    g.transport = transport;
     let opened = false;
     const signal = g.controller.signal;
-    const abort = () => { if (g.ws === ws) g.ws = null; clearTimeout(timeout); ws.close(); reject(new BridgeLifecycleError(410, "LEASE_RELEASED", "Generation cancelled")); };
+    const abort = () => { if (g.transport === transport) g.transport = null; clearTimeout(timeout); ws.close(); reject(new BridgeLifecycleError(410, "LEASE_RELEASED", "Generation cancelled")); };
     signal.addEventListener("abort", abort, { once: true });
-    const timeout = setTimeout(() => { if (g.ws === ws) g.ws = null; signal.removeEventListener("abort", abort); ws.close(); reject(new Error("Agent WebSocket handshake timed out")); }, CONNECT_MS);
-    const valid = () => current(w, g) && g.ws === ws;
+    const timeout = setTimeout(() => { if (g.transport === transport) g.transport = null; signal.removeEventListener("abort", abort); ws.close(); reject(new Error("Agent WebSocket handshake timed out")); }, CONNECT_MS);
+    const valid = () => current(w, g) && g.transport === transport;
     ws.on("open", () => {
       clearTimeout(timeout);
       if (!valid()) { ws.close(); reject(new BridgeLifecycleError(410, "LEASE_RELEASED", "Generation cancelled")); return; }
@@ -225,18 +529,15 @@ function open(id: string, w: Workspace, g: Generation, handle: AgentConnect): Pr
     });
     ws.on("message", data => {
       if (!valid()) return;
-      const frame = data.toString();
-      try { const event = JSON.parse(frame); if (event.type === "agent_end" && !event.willRetry) g.busy = false; } catch { /* non-JSON bridge diagnostics */ }
-      const subscribers = [...w.leases.values()].filter(l => !l.released).flatMap(l => [...l.subscribers]);
-      if (subscribers.length) for (const fn of subscribers) fn(frame);
-      else { g.outbound.push(frame); if (g.outbound.length > 1000) g.outbound.shift(); }
+      deliver(w, g, data.toString());
     });
-    ws.on("error", err => { if (!opened) { if (g.ws === ws) g.ws = null; clearTimeout(timeout); signal.removeEventListener("abort", abort); ws.close(); reject(err); } else if (valid()) g.busy = false; });
+    ws.on("error", err => { if (!opened) { if (g.transport === transport) g.transport = null; clearTimeout(timeout); signal.removeEventListener("abort", abort); ws.close(); reject(err); } else if (valid() && g.turn && g.busy) markUncertain(w, g, g.turn); });
     ws.on("close", () => {
       clearTimeout(timeout); signal.removeEventListener("abort", abort);
       if (!opened) { reject(new Error("Agent WebSocket closed before handshake")); return; }
       if (!valid()) return;
-      g.ws = null; g.busy = false;
+      g.transport = null;
+      if (g.turn && g.busy) markUncertain(w, g, g.turn);
       if ([...w.leases.values()].some(l => !l.released && l.subscribers.size)) {
         // A microtask lets the previous connection's single-flight settle first.
         void Promise.resolve().then(() => { if (current(w, g)) return connect(id, w, g); }).catch(() => {});

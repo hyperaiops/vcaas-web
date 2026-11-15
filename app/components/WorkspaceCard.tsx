@@ -34,19 +34,20 @@ export default function WorkspaceCard({ workspace, onDelete, deleting }: Props) 
   }
 
   return (
-    <div className="group flex flex-col rounded-lg border border-neutral-200 bg-white p-4 shadow-sm transition hover:border-blue-300 hover:shadow">
-      <div className="flex items-start justify-between gap-2">
+    <div className="group flex flex-col rounded-xl border border-[#d5d8ca] bg-white p-5 shadow-[4px_4px_0_#e6ebdb] transition-[border-color,box-shadow] hover:border-[#8c9877] hover:shadow-[5px_5px_0_#d4fa73] motion-reduce:transition-none">
+      <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h3 className="truncate text-sm font-semibold text-neutral-800">{workspace.name}</h3>
-          <p className="mt-0.5 truncate font-mono text-[13px] text-neutral-400">{workspace.id}</p>
+          <span className="mb-4 inline-grid h-10 w-10 place-items-center rounded-lg bg-[#eff5d9] text-lg text-[#526a36]" aria-hidden="true">✳</span>
+          <h3 className="truncate text-lg font-bold tracking-tight text-[var(--brand-ink)]">{workspace.name}</h3>
+          <p className="mt-1 truncate font-mono text-xs text-[#81877a]">{workspace.id}</p>
         </div>
         <span
-          className={`mt-1 h-2 w-2 shrink-0 rounded-full ${workspace.revision ? "bg-emerald-500" : "bg-neutral-300"}`}
+          className={`mt-1 h-2 w-2 shrink-0 rounded-full ${workspace.revision ? "bg-[#799b39]" : "bg-neutral-300"}`}
           title={workspace.revision ? "已有文件" : "暂无文件"}
         />
       </div>
 
-      <dl className="mt-3 space-y-1 text-[13px] text-neutral-500">
+      <dl className="mt-5 space-y-1.5 border-t border-[#ebede5] pt-4 text-[13px] text-[var(--brand-muted)]">
         <div className="flex justify-between gap-2">
           <dt className="text-neutral-400">状态</dt>
           <dd className="truncate">{workspace.revision ? "已就绪" : "暂无文件"}</dd>
@@ -61,18 +62,18 @@ export default function WorkspaceCard({ workspace, onDelete, deleting }: Props) 
         </div>
       </dl>
 
-      <div className="mt-4 flex items-center gap-2">
+      <div className="mt-5 flex items-center gap-3">
         <Link
           href={`/workspaces/${encodeURIComponent(workspace.id)}`}
-          className="flex-1 rounded bg-blue-600 px-3 py-1.5 text-center text-[13px] font-medium text-white hover:bg-blue-700"
+          className="brand-button min-h-10 flex-1 px-3 py-2 text-center text-[13px]"
         >
-          打开工作区
+          打开工作区 <span aria-hidden="true">↗</span>
         </Link>
         <button
           type="button"
           onClick={handleDelete}
           disabled={deleting}
-          className="rounded border border-red-300 px-3 py-1.5 text-[13px] font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
+          className="min-h-10 rounded-md border border-[#e8c9c5] px-3 py-2 text-[13px] font-medium text-[#a34a42] hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {deleting ? "正在删除…" : "删除"}
         </button>
