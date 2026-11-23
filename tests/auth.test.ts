@@ -1,7 +1,7 @@
 import "./setup";
 import assert from "node:assert/strict";
 import { test, after } from "node:test";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -24,6 +24,7 @@ import * as stop from "../app/api/v1/workspaces/[workspaceId]/agent/stop/route";
 import * as prompt from "../app/api/v1/workspaces/[workspaceId]/agent/prompt/route";
 import * as cancel from "../app/api/v1/workspaces/[workspaceId]/agent/cancel/route";
 import * as events from "../app/api/v1/workspaces/[workspaceId]/agent/events/route";
+import * as agentSession from "../app/api/v1/workspaces/[workspaceId]/agent/session/route";
 import * as legacy from "../app/api/chat/route";
 import * as callback from "../app/auth/callback/route";
 import * as login from "../app/auth/login/route";
@@ -116,6 +117,7 @@ test("all workspace routes deny unauthenticated and other-user requests before s
     () => files.PUT(request("PUT", { contents: "attacker" }), { params: Promise.resolve({ workspaceId: "project-a", path: ["index.txt"] }) }),
     () => start.POST(request("POST"), params), () => stop.POST(request("POST"), params),
     () => prompt.POST(request("POST", { message: "attack" }), params), () => cancel.POST(request("POST"), params), () => events.GET(request(), params),
+    () => agentSession.GET(request(), params), () => agentSession.POST(request("POST"), params),
     () => legacy.POST(request("POST", { workspaceId: "project-a", message: "attack" })),
   ];
   for (const route of routes) {
@@ -137,6 +139,8 @@ test("agent lease routes validate bodies only after authentication and ownership
       assert.equal((await response.json()).error.code, "INVALID_AGENT_LEASE");
     }
   }
+  assert.equal((await context(a.token, () => agentSession.POST(request("POST", { clientId }), params))).status, 400);
+  assert.equal((await context(a.token, () => agentSession.POST(request("POST", { clientId, revision: clientId, action: "new" }, "https://evil.test"), params))).status, 403);
   assert.equal((await context(a.token, () => prompt.POST(request("POST", { message: "hello" }), params))).status, 400);
   const turnId = "0d9a8059-0a3f-45c6-80cb-e1f20d282dd3";
   assert.equal((await context(a.token, () => cancel.POST(request("POST", { clientId }), params))).status, 400);
@@ -155,6 +159,9 @@ test("events rejects malformed IDs and ends unknown lease reconnects without sta
   const unknown = new Request("https://console.test/api/test?clientId=7cb3f030-39f2-4f88-a430-dad82674a073");
   assert.equal((await context(null, () => events.GET(unknown, params))).status, 401);
   assert.equal((await context(b.token, () => events.GET(unknown, params))).status, 404);
+  assert.equal((await context(a.token, () => agentSession.GET(malformed, params))).status, 400);
+  assert.equal((await context(a.token, () => agentSession.GET(unknown, params))).status, 410);
+  assert.equal((await context(b.token, () => agentSession.GET(unknown, params))).status, 404);
   const response = await context(a.token, () => events.GET(unknown, params));
   assert.equal(response.status, 204);
   assert.equal(await response.text(), "");
@@ -226,6 +233,51 @@ test("owners can read/write, and conditional requests cannot bypass ownership", 
   }));
   assert.equal(written.status, 200);
   assert.equal(readFileSync(path.join(workspaceRoot, "index.txt"), "utf8"), "owner change");
+});
+
+test("attachment writes preserve bytes and enforce configured file and workspace limits", async (t) => {
+  const previousFileLimit = process.env.WORKSPACE_MAX_FILE_BYTES;
+  const previousTotalLimit = process.env.WORKSPACE_MAX_TOTAL_BYTES;
+  t.after(() => {
+    if (previousFileLimit === undefined) delete process.env.WORKSPACE_MAX_FILE_BYTES;
+    else process.env.WORKSPACE_MAX_FILE_BYTES = previousFileLimit;
+    if (previousTotalLimit === undefined) delete process.env.WORKSPACE_MAX_TOTAL_BYTES;
+    else process.env.WORKSPACE_MAX_TOTAL_BYTES = previousTotalLimit;
+    rmSync(path.join(workspaceRoot, "upload-link"), { force: true });
+    rmSync(path.join(workspaceRoot, ".attachments"), { recursive: true, force: true });
+  });
+  process.env.WORKSPACE_MAX_FILE_BYTES = "1024";
+  process.env.WORKSPACE_MAX_TOTAL_BYTES = "1500";
+  const bytes = Uint8Array.from([0, 255, 128, 65, 10]);
+  const fileParams = (segments: string[]) => ({ params: Promise.resolve({ workspaceId: "project-a", path: segments }) });
+  const upload = (body: Uint8Array) => new Request("https://console.test/api/test", {
+    method: "PUT", headers: { origin: "https://console.test", "content-type": "application/octet-stream" }, body: Buffer.from(body),
+  });
+  const segments = [".attachments", "图片 test.png"];
+  assert.equal((await context(null, () => files.PUT(upload(bytes), fileParams(segments)))).status, 401);
+  assert.equal((await context(b.token, () => files.PUT(upload(bytes), fileParams(segments)))).status, 404);
+  assert.equal((await context(a.token, () => files.PUT(upload(bytes), fileParams(segments)))).status, 200);
+  assert.deepEqual(readFileSync(path.join(workspaceRoot, ...segments)), Buffer.from(bytes));
+  assert.equal((await context(a.token, () => files.PUT(upload(new Uint8Array(1024)), fileParams([".attachments", "limit.bin"])))).status, 200);
+  assert.equal((await context(a.token, () => files.PUT(upload(new Uint8Array(1025)), fileParams([".attachments", "large.bin"])))).status, 413);
+  assert.ok(!existsSync(path.join(workspaceRoot, ".attachments", "large.bin")));
+  const manifestResponse = await context(a.token, () => manifest.GET(request(), params));
+  assert.deepEqual((await manifestResponse.json()).limits, { maxFiles: 10_000, maxDepth: 32, maxFileBytes: 1024, maxTotalBytes: 1500 });
+  const writes = await Promise.all(["one.bin", "two.bin"].map((name) =>
+    context(a.token, () => files.PUT(upload(new Uint8Array(300)), fileParams([".attachments", name]))),
+  ));
+  assert.deepEqual(writes.map((response) => response.status).sort(), [200, 413]);
+  assert.equal((await writes.find((response) => response.status === 413)!.json()).error.code, "WORKSPACE_TOTAL_TOO_LARGE");
+  assert.equal((await context(a.token, () => files.PUT(upload(bytes), fileParams([".attachments/file.bin"])))).status, 400);
+  assert.equal((await context(a.token, () => files.PUT(upload(bytes), fileParams(["..", "file.bin"])))).status, 400);
+
+  const outside = path.join(root, "outside");
+  mkdirSync(outside);
+  symlinkSync(outside, path.join(workspaceRoot, "upload-link"));
+  assert.equal((await context(a.token, () => files.PUT(upload(bytes), fileParams(["upload-link", "file.bin"])))).status, 400);
+  assert.ok(!existsSync(path.join(outside, "file.bin")));
+  rmSync(path.join(workspaceRoot, "upload-link"));
+  rmSync(path.join(workspaceRoot, ".attachments"), { recursive: true });
 });
 
 test("SSE stops before delivering another frame after session revocation", async () => {

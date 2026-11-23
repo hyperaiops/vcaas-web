@@ -18,7 +18,7 @@ type Message = {
 
 type TurnSnapshot = { id: string; text: string; phase: TurnPhase; activities: Activity[]; truncated?: boolean };
 type PiEvent =
-  | { type: "turn_snapshot"; version: 1; sequence: number; busy: boolean; turn?: TurnSnapshot }
+  | { type: "turn_snapshot"; version: 1; sequence: number; busy: boolean; revision: string; switching: boolean; uncertain: boolean; turn?: TurnSnapshot }
   | { type: "turn_event"; version: 1; sequence: number; turnId: string; event:
       | { kind: "text"; delta: string }
       | { kind: "phase"; phase: TurnPhase }
@@ -32,14 +32,40 @@ const activityLabel = (name: string) => ({
 
 type ConnState = "connecting" | "open" | "closed" | "error";
 
-// Matches the server-side DEFAULT_LIMITS.maxFileBytes (files API rejects larger writes).
-const MAX_ATTACHMENT_BYTES = 1024 * 1024;
 const ATTACHMENTS_DIR = ".attachments";
+
+function formatBytes(bytes: number): string {
+  const value = bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(2)} MiB` : `${(bytes / 1024).toFixed(2)} KiB`;
+  return `${value}（${bytes.toLocaleString("en-US")} 字节）`;
+}
+
+async function uploadError(response: Response): Promise<string> {
+  let code: string | undefined;
+  let message: string | undefined;
+  if (response.headers.get("content-type")?.includes("application/json")) {
+    try {
+      const body = await response.json();
+      code = body?.error?.code;
+      message = body?.error?.message;
+    } catch { /* A proxy may return an invalid or empty response. */ }
+  }
+  const knownCodes = ["FILE_TOO_LARGE", "WORKSPACE_TOTAL_TOO_LARGE", "WORKSPACE_FILE_COUNT_LIMIT", "WORKSPACE_INVALID", "INVALID_REQUEST", "INVALID_PATH", "PATH_IGNORED", "PATH_OUTSIDE_WORKSPACE", "PATH_UNSAFE", "PATH_IS_DIRECTORY", "WRITE_FAILED", "WORKSPACE_NOT_FOUND", "ORIGIN_MISMATCH"];
+  if (typeof code === "string" && knownCodes.includes(code) && typeof message === "string") {
+    return `${message.slice(0, 300)}（${response.status}）`;
+  }
+  if (response.status === 413) {
+    return "服务器或网关拒绝了请求（413），网关的大小限制可能低于应用配置，请联系管理员。";
+  }
+  if (response.status === 403) return "没有权限上传该文件（403）。";
+  if (response.status === 404) return "工作区不存在或无权访问（404）。";
+  return `服务器拒绝上传（${response.status}），请稍后重试。`;
+}
 
 type PendingAttachment = {
   name: string;
   path: string;
   status: "uploading" | "ready" | "failed";
+  error?: string;
 };
 
 type Activation = {
@@ -51,7 +77,13 @@ type Activation = {
   streamingId: number | null;
   turnId: string | null;
   sequence: number;
+  revision: string | null;
+  sessionActionPending: boolean;
   cancelPending: boolean;
+  historyReady: boolean;
+  historyLoading: boolean;
+  historySupported: boolean | null;
+  serverBusy: boolean;
   draft: { text: string; attachments: PendingAttachment[] } | null;
   readyTimer?: ReturnType<typeof setTimeout>;
   controller: AbortController;
@@ -59,29 +91,38 @@ type Activation = {
 };
 
 const agentBase = (wid: string) => `/api/v1/workspaces/${encodeURIComponent(wid)}/agent`;
+const welcome: Message = {
+  id: 0,
+  role: "agent",
+  text: "你好！我是随心一码 AI 编程助手。告诉我你想做什么应用，我会帮你编写代码，并在右侧 WebContainer 中实时预览。",
+};
 
-export default function AgentPanel({ workspaceId }: { workspaceId: string | null }) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: 0,
-      role: "agent",
-      text: "你好！我是随心一码 AI 编程助手。告诉我你想做什么应用，我会帮你编写代码，并在右侧 WebContainer 中实时预览。",
-    },
-  ]);
+type AgentPanelProps = { workspaceId: string | null; maxFileBytes?: number | null };
+
+export default function AgentPanel(props: AgentPanelProps) {
+  return <AgentPanelContent key={props.workspaceId ?? ""} {...props} />;
+}
+
+function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps) {
+  const [messages, setMessages] = useState<Message[]>([welcome]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [otherBusy, setOtherBusy] = useState(false);
   const [phase, setPhase] = useState<TurnPhase>("running");
   const [stopping, setStopping] = useState(false);
   const [conn, setConn] = useState<ConnState>("connecting");
+  const [historyState, setHistoryState] = useState<"loading" | "ready" | "error">("loading");
+  const [sessionSupported, setSessionSupported] = useState(false);
+  const [canRestore, setCanRestore] = useState(false);
+  const [restoreNeedsMigration, setRestoreNeedsMigration] = useState(false);
+  const [sessionSwitching, setSessionSwitching] = useState(false);
+  const [sessionActionPending, setSessionActionPending] = useState(false);
+  const [sessionUncertain, setSessionUncertain] = useState(false);
+  const [sessionNotice, setSessionNotice] = useState("");
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const idRef = useRef(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Uploads already in flight, keyed by attachment path, so StrictMode replays
-  // and re-mounts cannot double-send the same file.
-  const uploadsRef = useRef(new Set<string>());
-
   // The server holds the authenticated WebSocket to the agent; the browser
   // reads events over SSE and sends prompts over POST. Each page activation
   // owns a lease, while the Pi conversation is shared by the workspace session.
@@ -131,6 +172,60 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
       }
     }
 
+    async function loadHistory(lease: Activation) {
+      const current = () => !lease.released && activeRef.current === lease;
+      if (!current() || !lease.ready || lease.serverBusy || lease.historyReady || lease.historyLoading) return;
+      lease.historyLoading = true;
+      const requestedAt = lease.sequence;
+      let retry = false;
+      try {
+        const res = await authenticatedFetch(`${agentBase(wid)}/session?clientId=${encodeURIComponent(lease.clientId)}`, {
+          cache: "no-store", signal: lease.controller.signal,
+        });
+        if (!current()) return;
+        if (res.status === 409) {
+          retry = lease.sequence !== requestedAt;
+          return;
+        }
+        if (!res.ok) throw new Error("history request failed");
+        const body: unknown = await res.json();
+        if (!current()) return;
+        if (!body || typeof body !== "object" || !("supported" in body)) throw new Error("invalid history response");
+        if (body.supported === false) {
+          lease.historySupported = false;
+          lease.historyReady = true;
+          setSessionSupported(false);
+          setHistoryState("ready");
+          return;
+        }
+        if (body.supported !== true || !("sequence" in body) || !Number.isSafeInteger(body.sequence) ||
+            !("revision" in body) || typeof body.revision !== "string" || !("canRestore" in body) || typeof body.canRestore !== "boolean" ||
+            !("messages" in body) || !Array.isArray(body.messages)) throw new Error("invalid history response");
+        if (!lease.ready || lease.serverBusy || body.sequence !== lease.sequence || body.revision !== lease.revision) {
+          retry = lease.ready && !lease.serverBusy && typeof body.sequence === "number" &&
+            (body.sequence < lease.sequence || (body.sequence === lease.sequence && body.revision !== lease.revision));
+          return;
+        }
+        const restored: Message[] = body.messages.map((item: unknown) => {
+          if (!item || typeof item !== "object" || !("role" in item) || !("text" in item) ||
+              (item.role !== "user" && item.role !== "agent") || typeof item.text !== "string") throw new Error("invalid history message");
+          return { id: idRef.current++, role: item.role, text: item.text };
+        });
+        setMessages(restored.length ? restored : [welcome]);
+        setSessionSupported(true);
+        setCanRestore(body.canRestore);
+        setRestoreNeedsMigration("restoreNeedsMigration" in body && body.restoreNeedsMigration === true);
+        lease.historySupported = true;
+        lease.historyReady = true;
+        setHistoryState("ready");
+      } catch {
+        if (current()) setHistoryState("error");
+      } finally {
+        lease.historyLoading = false;
+        if (retry && current() && lease.ready && !lease.serverBusy) void loadHistory(lease);
+      }
+    }
+
     async function connect(lease: Activation) {
       const current = () => !lease.released && activeRef.current === lease;
       setConn("connecting");
@@ -166,14 +261,38 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           }
           if (!event || typeof event !== "object" || event.version !== 1 || !Number.isSafeInteger(event.sequence)) return;
           if (event.type === "turn_snapshot") {
-            if (event.sequence < lease.sequence) return;
+            if (event.sequence < lease.sequence || typeof event.revision !== "string") return;
+            if (lease.revision !== null && lease.revision !== event.revision) {
+              restoreDraft(lease);
+              lease.draft = null;
+              lease.streamingId = null;
+              lease.turnId = null;
+              lease.cancelPending = false;
+              lease.historyReady = false;
+              setMessages([welcome]);
+              setBusy(false);
+              setStopping(false);
+              setCanRestore(false);
+              setHistoryState("loading");
+            }
+            lease.revision = event.revision;
             lease.sequence = event.sequence;
             lease.ready = true;
+            lease.serverBusy = event.busy;
             if (lease.readyTimer) clearTimeout(lease.readyTimer);
             lease.readyTimer = undefined;
             setConn("open");
             const turn = event.turn;
-            setOtherBusy(event.busy && (!turn || isFinished(turn.phase)));
+            const ownTurn = !!turn && turn.id === lease.turnId && !isFinished(turn.phase);
+            const otherPageBusy = event.busy && !ownTurn;
+            setOtherBusy(otherPageBusy);
+            setSessionSwitching(event.switching === true);
+            setSessionUncertain(event.uncertain === true || (otherPageBusy && turn?.phase === "uncertain"));
+            if (otherPageBusy && lease.historySupported === true && lease.historyReady) {
+              lease.historyReady = false;
+              setHistoryState("loading");
+            }
+            if (!event.busy && !lease.historyReady) void loadHistory(lease);
             const id = lease.streamingId;
             if (!turn || turn.id !== lease.turnId || id === null || typeof turn.text !== "string" || !Array.isArray(turn.activities)) return;
             setPhase(turn.phase);
@@ -228,6 +347,10 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           // EventSource hides HTTP status codes. Check an authenticated API so
           // an expired/revoked session navigates to login instead of retrying forever.
           lease.ready = false;
+          if (lease.historySupported === true) {
+            lease.historyReady = false;
+            setHistoryState("loading");
+          }
           if (sse.readyState === 2) setConn("error");
           else { setConn("connecting"); waitForSnapshot(); }
           void authenticatedFetch(`/api/v1/workspaces/${encodeURIComponent(wid)}`, { cache: "no-store" }).catch(() => {});
@@ -251,9 +374,17 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
       activation = {
         clientId: crypto.randomUUID(), issuedAt: Date.now(), workspaceId: wid,
         released: false, ready: false, streamingId: null, turnId: null,
-        sequence: -1, cancelPending: false, draft: null, controller: new AbortController(), sse: null,
+        sequence: -1, revision: null, sessionActionPending: false, cancelPending: false, historyReady: false, historyLoading: false, historySupported: null, serverBusy: false,
+        draft: null, controller: new AbortController(), sse: null,
       };
       activeRef.current = activation;
+      setHistoryState("loading");
+      setSessionSupported(false);
+      setCanRestore(false);
+      setSessionSwitching(false);
+      setSessionActionPending(false);
+      setSessionUncertain(false);
+      setSessionNotice("");
       setBusy(false);
       setOtherBusy(false);
       setStopping(false);
@@ -282,31 +413,31 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
     if (!workspaceId) return;
     const wid = workspaceId;
     for (const file of Array.from(files)) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        setMessages((prev) => [
-          ...prev,
-          { id: idRef.current++, role: "agent", text: `附件 ${file.name} 超过 ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB 大小限制，未上传。` },
-        ]);
+      const safeName = Array.from(file.name.replace(/[\x00-\x1f\x7f\\/:*?"<>|#%]/g, "_")).slice(0, 40).join("") || "attachment";
+      const attachmentName = `${crypto.randomUUID()}-${safeName}`;
+      const attachmentPath = `${ATTACHMENTS_DIR}/${attachmentName}`;
+      if (maxFileBytes !== null && file.size > maxFileBytes) {
+        setAttachments((prev) => [...prev, {
+          name: file.name, path: attachmentPath, status: "failed",
+          error: `文件大小为 ${formatBytes(file.size)}，超过单个文件上限 ${formatBytes(maxFileBytes)}。`,
+        }]);
         continue;
       }
-      const safeName = file.name.replace(/[\\/:*?"<>|#%]/g, "_").slice(0, 120) || "attachment";
-      const attachmentPath = `${ATTACHMENTS_DIR}/${Date.now()}-${safeName}`;
-      if (uploadsRef.current.has(attachmentPath)) continue;
-      uploadsRef.current.add(attachmentPath);
       const pending: PendingAttachment = { name: file.name, path: attachmentPath, status: "uploading" };
       setAttachments((prev) => [...prev, pending]);
       try {
-        const contents = await file.text();
         const res = await authenticatedFetch(
-          `/api/v1/workspaces/${encodeURIComponent(wid)}/files/${encodeURIComponent(attachmentPath)}`,
-          { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents }) },
+          `/api/v1/workspaces/${encodeURIComponent(wid)}/files/${encodeURIComponent(ATTACHMENTS_DIR)}/${encodeURIComponent(attachmentName)}`,
+          { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: file },
         );
-        if (!res.ok) throw new Error(`upload failed: ${res.status}`);
-        setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "ready" } : a)));
+        if (!res.ok) {
+          const error = `文件大小：${formatBytes(file.size)}。${await uploadError(res)}`;
+          setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "failed", error } : a)));
+        } else {
+          setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "ready" } : a)));
+        }
       } catch {
-        setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "failed" } : a)));
-      } finally {
-        uploadsRef.current.delete(attachmentPath);
+        setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "failed", error: "网络连接失败，请检查网络或登录状态后重试。" } : a)));
       }
     }
   }
@@ -319,7 +450,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
     const text = input.trim();
     if (!text || busy || otherBusy) return;
     const lease = activeRef.current;
-    if (!lease || lease.released || !lease.ready || lease.turnId !== null || lease.workspaceId !== workspaceId) return;
+    if (!lease || lease.released || !lease.ready || !lease.historyReady || !lease.revision || lease.serverBusy || lease.sessionActionPending || lease.turnId !== null || lease.workspaceId !== workspaceId) return;
     if (attachments.some((a) => a.status === "uploading")) return;
 
     const ready = attachments.filter((a) => a.status === "ready");
@@ -347,7 +478,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
       const res = await authenticatedFetch(`${agentBase(lease.workspaceId)}/prompt`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clientId: lease.clientId, turnId, message: body }),
+        body: JSON.stringify({ clientId: lease.clientId, turnId, message: body, revision: lease.revision }),
       });
       if (!res.ok && res.status >= 500 && !lease.released && activeRef.current === lease && lease.turnId === turnId) {
         restoreDraft(lease);
@@ -356,7 +487,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           : m));
       } else if (!res.ok && !lease.released && activeRef.current === lease && lease.turnId === turnId) {
         setMessages((prev) => prev.map((m) => m.id === agentMsg.id
-          ? { ...m, streaming: false, phase: "failed", notice: res.status === 409 ? "其他页面正在处理，请稍后再试。" : "消息发送失败，请稍后重试。" }
+          ? { ...m, streaming: false, phase: "failed", notice: res.status === 409 ? "会话已变化或其他页面正在处理，请稍后再试。" : "消息发送失败，请稍后重试。" }
           : m));
         restoreDraft(lease);
         setBusy(false);
@@ -375,6 +506,46 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
     }
   }
 
+  async function changeSession(action: "new" | "restore") {
+    const lease = activeRef.current;
+    if (!lease || lease.released || !lease.ready || !lease.historyReady || !lease.revision ||
+        lease.serverBusy || lease.sessionActionPending || lease.turnId !== null || !sessionSupported || sessionUncertain ||
+        (action === "restore" && !canRestore)) return;
+    const confirmMigration = action === "restore" && restoreNeedsMigration;
+    if (confirmMigration && !window.confirm("此会话使用旧格式，Pi 恢复时可能改写原文件。请先备份，确认继续？")) return;
+    lease.sessionActionPending = true;
+    setSessionActionPending(true);
+    setSessionNotice("");
+    try {
+      const res = await authenticatedFetch(`${agentBase(lease.workspaceId)}/session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId: lease.clientId, revision: lease.revision, action, confirmMigration }),
+        signal: lease.controller.signal,
+      });
+      if (lease.released || activeRef.current !== lease) return;
+      const body = await res.json().catch(() => ({}));
+      if (lease.released || activeRef.current !== lease) return;
+      if (!res.ok) {
+        const code = body?.error?.code;
+        if (code === "SESSION_NOT_SAVED") setSessionNotice("当前会话有未保存的消息，暂时无法切换。");
+        else if (code === "SESSION_EXPIRED") { setCanRestore(false); setSessionNotice("没有可恢复的 24 小时内会话。"); }
+        else if (code === "SESSION_CHANGED" || code === "AGENT_BUSY") setSessionNotice("会话状态已变化，请稍后重试。");
+        else setSessionNotice("无法切换会话，请稍后重试。");
+        if (res.status >= 500) { lease.historyReady = false; setSessionUncertain(true); }
+      } else if (body.cancelled === true) setSessionNotice("会话切换已取消。");
+    } catch {
+      if (!lease.released && activeRef.current === lease) {
+        lease.historyReady = false;
+        setSessionUncertain(true);
+        setSessionNotice("切换状态未确认，请关闭所有工作区页面后重新打开。");
+      }
+    } finally {
+      lease.sessionActionPending = false;
+      if (!lease.released && activeRef.current === lease) setSessionActionPending(false);
+    }
+  }
+
   async function stop() {
     const lease = activeRef.current;
     const turnId = lease?.turnId;
@@ -389,7 +560,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
       const res = await authenticatedFetch(`${agentBase(lease.workspaceId)}/cancel`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clientId: lease.clientId, turnId }),
+        body: JSON.stringify({ clientId: lease.clientId, turnId, revision: lease.revision }),
       });
       if (!res.ok) throw new Error("cancel failed");
     } catch {
@@ -403,7 +574,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
 
   const workingLabel = phase === "uncertain" ? "任务状态未确认" : stopping ? "正在停止" : phase === "retrying" ? "正在重试" : phase === "compacting" ? "正在整理上下文" : "正在处理";
   const statusLabel =
-    conn === "open" ? (busy ? workingLabel : otherBusy ? "其他页面正在处理" : "等待输入") :
+    conn === "open" ? (sessionUncertain ? "会话状态未确认" : sessionSwitching || sessionActionPending ? "正在切换会话" : busy ? workingLabel : otherBusy ? "其他页面正在处理" : historyState === "error" ? "会话恢复失败" : historyState === "loading" ? "正在恢复会话" : "等待输入") :
     conn === "connecting" ? "正在连接" :
     conn === "error" ? "连接失败" : "已断开连接";
   const dotColor =
@@ -417,10 +588,26 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
         <span className="flex items-center gap-2 text-sm font-bold text-[var(--brand-ink)]">
           <span className="grid h-7 w-7 place-items-center rounded-md bg-[var(--brand-lime)] text-base" aria-hidden="true">✳</span>AI 编程助手
         </span>
-        <span role="status" aria-live="polite" className="flex items-center gap-1.5 rounded-full border border-[#dce3d3] bg-white px-2.5 py-1 text-xs text-[var(--brand-muted)]">
-          <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
-          {statusLabel}
-        </span>
+        <div className="flex items-center gap-1.5">
+          <span role="status" aria-live="polite" className="flex items-center gap-1.5 rounded-full border border-[#dce3d3] bg-white px-2.5 py-1 text-xs text-[var(--brand-muted)]">
+            <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
+            {statusLabel}
+          </span>
+          <span title="新建会话（空会话未保存，重新打开可能恢复上次会话）">
+            <button type="button" aria-label="新建会话" title="新建会话（空会话未保存，重新打开可能恢复上次会话）" onClick={() => void changeSession("new")}
+              disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || sessionSwitching || sessionActionPending || sessionUncertain || busy || otherBusy}
+              className="grid h-8 w-8 place-items-center rounded text-neutral-500 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40">
+              <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+            </button>
+          </span>
+          <span title="恢复上次会话（仅限 24 小时内）">
+            <button type="button" aria-label="恢复上次会话" title="恢复上次会话（仅限 24 小时内）" onClick={() => void changeSession("restore")}
+              disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || !canRestore || sessionSwitching || sessionActionPending || sessionUncertain || busy || otherBusy}
+              className="grid h-8 w-8 place-items-center rounded text-neutral-500 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40">
+              <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l3 2" /></svg>
+            </button>
+          </span>
+        </div>
       </div>
 
       {/* Messages */}
@@ -428,6 +615,9 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
         ref={scrollRef}
         className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-5"
       >
+        {sessionUncertain && <p role="alert" className="text-sm text-red-600">会话状态未确认，请关闭所有工作区页面后重新打开。</p>}
+        {sessionNotice && <p role="alert" className="text-sm text-red-600">{sessionNotice}</p>}
+        {historyState === "error" && <p role="alert" className="text-sm text-red-600">无法恢复最近会话，请刷新页面重试。</p>}
         {messages.map((m) => (
           <div
             key={m.id}
@@ -494,9 +684,9 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
                 <svg className="h-3 w-3 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l8.57-8.57A4 4 0 1118 8.84l-8.59 8.57a2 2 0 01-2.83-2.83l8.49-8.48" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
-                <span className="truncate">
+                <span className="min-w-0 break-all">
                   {a.name}
-                  {a.status === "uploading" ? " · 上传中…" : a.status === "failed" ? " · 上传失败" : ""}
+                  {a.status === "uploading" ? " · 上传中…" : a.status === "failed" ? <span role="alert"> · 上传失败：{a.error}</span> : ""}
                 </span>
                 <button
                   type="button"
@@ -558,7 +748,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           ) : (
             <button
               type="submit"
-              disabled={otherBusy || !input.trim() || conn !== "open" || attachments.some((a) => a.status !== "ready")}
+              disabled={otherBusy || sessionSwitching || sessionActionPending || sessionUncertain || historyState !== "ready" || !input.trim() || conn !== "open" || attachments.some((a) => a.status !== "ready")}
               className="brand-button min-h-9 px-3 py-1.5 text-sm"
             >
               发送
@@ -566,7 +756,7 @@ export default function AgentPanel({ workspaceId }: { workspaceId: string | null
           )}
         </div>
         <p className="mt-1.5 px-0.5 text-[13px] text-neutral-400">
-          Enter 发送 · Shift+Enter 换行 · 附件保存到工作区 .attachments/
+          Enter 发送 · Shift+Enter 换行 · 附件保存到工作区 .attachments/{maxFileBytes !== null ? ` · 单个文件上限 ${formatBytes(maxFileBytes)}` : ""}
         </p>
       </form>
     </div>

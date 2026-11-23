@@ -121,6 +121,7 @@ test("service connection preserves URL and encodes the token", async () => {
     "node:crypto": { randomUUID: () => "id" },
     "@/app/lib/bridge/runtime": { runtimeMode: () => "prod", BridgeLifecycleError: class extends Error { constructor(public status: number, public code: string, message: string) { super(message); } } },
     "@/app/lib/bridge/local": { LocalPiTransport: class {} },
+    "@/app/lib/bridge/transcript": { projectTranscript: () => [] },
     ws: Socket, "@/app/lib/bridge/k8s": { ensurePiWorker: async () => ({ endpoint, token }), deletePiWorker: async () => {} },
   }, false);
   const lease = { clientId: "00000000-0000-4000-8000-000000000001", issuedAt: 0 };

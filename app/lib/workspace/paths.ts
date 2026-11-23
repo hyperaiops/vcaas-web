@@ -78,21 +78,25 @@ export async function resolveSafeFilePath(
     throw new WorkspacePathError("PATH_OUTSIDE_WORKSPACE", "该路径超出了工作区范围。");
   }
 
-  let info;
-  try {
-    info = await fs.lstat(resolved);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      // New file — allowed (parent must exist; created below if needed).
-      return resolved;
+  let current = rootPath;
+  for (let i = 0; i < segments.length; i++) {
+    current = path.join(current, segments[i]);
+    let info;
+    try {
+      info = await fs.lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw new WorkspacePathError("INVALID_PATH", "无法检查目标路径。");
     }
-    throw new WorkspacePathError("INVALID_PATH", "无法检查目标路径。");
-  }
-  if (info.isSymbolicLink()) {
-    throw new WorkspacePathError("PATH_UNSAFE", "不允许写入符号链接。");
-  }
-  if (info.isDirectory()) {
-    throw new WorkspacePathError("PATH_IS_DIRECTORY", "该路径是一个目录。");
+    if (info.isSymbolicLink()) {
+      throw new WorkspacePathError("PATH_UNSAFE", "不允许写入符号链接。");
+    }
+    if (i < segments.length - 1 && !info.isDirectory()) {
+      throw new WorkspacePathError("INVALID_PATH", "文件路径的父级必须是目录。");
+    }
+    if (i === segments.length - 1 && info.isDirectory()) {
+      throw new WorkspacePathError("PATH_IS_DIRECTORY", "该路径是一个目录。");
+    }
   }
   return resolved;
 }

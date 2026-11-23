@@ -20,7 +20,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import type { Stats } from "node:fs";
 import type { TreeNode, WorkspaceLimits } from "./types";
-import { DEFAULT_LIMITS } from "./types";
+import { getWorkspaceLimits } from "./limits";
 import { isIgnoredName } from "./paths";
 
 export type BuiltTree = {
@@ -48,7 +48,7 @@ export class WorkspaceTreeError extends Error {
 
 export async function buildTree(
   root: string,
-  limits: WorkspaceLimits = DEFAULT_LIMITS,
+  limits: WorkspaceLimits = getWorkspaceLimits(),
 ): Promise<BuiltTree> {
   const absolute = path.resolve(root);
   try {

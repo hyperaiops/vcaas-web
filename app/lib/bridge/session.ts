@@ -9,6 +9,8 @@ import WebSocket from "ws";
 import { ensurePiWorker, deletePiWorker } from "@/app/lib/bridge/k8s";
 import { LocalPiTransport } from "@/app/lib/bridge/local";
 import { runtimeMode, BridgeLifecycleError } from "@/app/lib/bridge/runtime";
+import { projectTranscript } from "@/app/lib/bridge/transcript";
+import type { LocalSession } from "@/app/lib/bridge/local-sessions";
 
 export { BridgeLifecycleError };
 
@@ -33,10 +35,13 @@ type Turn = {
   cancelRequested: boolean; aborted: boolean; failed: boolean; pendingAborts: Set<string>; epoch: number; abortEpoch: number;
   timer?: ReturnType<typeof setTimeout>;
 };
+type PendingRpc = { command: string; resolve: (data: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 type Generation = {
   controller: AbortController; connecting: Promise<AgentConnect> | null; transport: Transport | null;
   handle: AgentConnect | null; busy: boolean; turn: Turn | null; sequence: number;
+  revision: string; switching: boolean; switchUncertain: boolean; restoreCandidate: LocalSession | null;
   cancelled: Map<string, number>; completed: Map<string, Turn>; recent: Map<string, number>;
+  pendingRpc: Map<string, PendingRpc>;
 };
 type Workspace = { leases: Map<string, Lease>; generation: Generation | null; cleanup: Promise<void> | null; dirty: boolean; fenced: boolean; retry?: ReturnType<typeof setTimeout> };
 const workspaces = new Map<string, Workspace>();
@@ -105,12 +110,13 @@ function shutdown(id: string, w: Workspace): Promise<void> {
   w.generation = null; w.dirty = true;
   if (g) {
     g.controller.abort();
+    rejectPendingRpc(g);
     if (g.turn) clearTurnTimer(g.turn);
     g.busy = false;
-    void teardownTransport(g.transport);
   }
   const operation = (async () => {
     await g?.connecting?.catch(() => {});
+    await teardownTransport(g?.transport ?? null);
     await teardown(id);
     w.dirty = false;
   })();
@@ -152,7 +158,7 @@ export async function ensureAgentSession(id: string, input: AgentLease): Promise
   }
   live(w, input.clientId);
   if (w.dirty) { release(w, l); error(503, "CLEANUP_PENDING", "Agent cleanup must succeed before starting"); }
-  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, transport: null, handle: null, busy: false, turn: null, sequence: 0, cancelled: new Map(), completed: new Map(), recent: new Map() };
+  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, transport: null, handle: null, busy: false, turn: null, sequence: 0, revision: randomUUID(), switching: false, switchUncertain: false, restoreCandidate: null, cancelled: new Map(), completed: new Map(), recent: new Map(), pendingRpc: new Map() };
   try {
     const handle = await connect(id, w, w.generation);
     live(w, input.clientId);
@@ -189,6 +195,7 @@ function snapshot(g: Generation, clientId: string): string {
   const t = g.turn?.clientId === clientId ? g.turn : g.completed.get(clientId);
   return JSON.stringify({
     type: "turn_snapshot", version: 1, sequence: g.sequence, busy: g.busy,
+    revision: g.revision, switching: g.switching, uncertain: g.switchUncertain,
     ...(t ? { turn: { id: t.id, text: t.text, phase: t.phase, activities: t.activities, truncated: t.truncated } } : {}),
   });
 }
@@ -271,12 +278,13 @@ function newTurn(clientId: string, turnId: string): Turn {
     cancelRequested: false, aborted: false, failed: false, pendingAborts: new Set(), epoch: 0, abortEpoch: 0,
   };
 }
-export async function sendPrompt(id: string, clientId: string, message: string, turnId: string = randomUUID()): Promise<void> {
+export async function sendPrompt(id: string, clientId: string, message: string, turnId: string = randomUUID(), revision?: string): Promise<void> {
   const w = workspaces.get(id);
   if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
   live(w, clientId);
   const g = w.generation;
   if (!g) error(410, "LEASE_RELEASED", "Agent was released");
+  if (runtimeMode() === "local" && revision !== g.revision) error(409, "SESSION_CHANGED", "Agent session changed");
   if (g.turn?.id === turnId && g.turn.clientId === clientId) return;
   const recentKey = `${clientId}:${turnId}`;
   const recentExpiry = g.recent.get(recentKey);
@@ -299,6 +307,7 @@ export async function sendPrompt(id: string, clientId: string, message: string, 
   try {
     await connect(id, w, g);
     live(w, clientId); check(w, g);
+    if (runtimeMode() === "local" && revision !== g.revision) error(409, "SESSION_CHANGED", "Agent session changed");
     if (g.turn !== t || !g.busy) return;
     if (t.cancelRequested) {
       t.aborted = true; t.settled = true;
@@ -316,12 +325,14 @@ export async function sendPrompt(id: string, clientId: string, message: string, 
     throw err;
   }
 }
-export async function cancelTurn(id: string, clientId: string, turnId: string): Promise<void> {
+export async function cancelTurn(id: string, clientId: string, turnId: string, revision?: string): Promise<void> {
   const w = workspaces.get(id);
   if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
   live(w, clientId);
   const g = w.generation;
   if (!g) error(410, "LEASE_RELEASED", "Agent was released");
+  if (runtimeMode() === "local" && revision !== g.revision) error(409, "SESSION_CHANGED", "Agent session changed");
+  if (g.switching || g.switchUncertain) error(409, "AGENT_BUSY", "Agent session is changing");
   const t = g.turn;
   if (!t || t.id !== turnId) {
     if ((g.recent.get(`${clientId}:${turnId}`) ?? 0) > Date.now()) return;
@@ -345,6 +356,118 @@ export async function cancelTurn(id: string, clientId: string, turnId: string): 
   if (!t.sent) { t.aborted = true; t.settled = true; finishTurn(w, g, t); return; }
   requestAbort(w, g, t);
 }
+function rejectPendingRpc(g: Generation) {
+  for (const pending of g.pendingRpc.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(new BridgeLifecycleError(503, "AGENT_CLOSED", "Agent connection closed."));
+  }
+  g.pendingRpc.clear();
+}
+
+function requestLocalRpc(g: Generation, command: "get_state" | "get_entries" | "new_session" | "switch_session", sessionPath?: string): Promise<unknown> {
+  const transport = g.transport;
+  if (!transport || transport.kind !== "local") error(503, "AGENT_CLOSED", "Local agent is not connected.");
+  if (g.pendingRpc.size >= 32) error(503, "AGENT_CAPACITY", "Too many session requests.");
+  const id = `rpc-${randomUUID()}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      g.pendingRpc.delete(id);
+      reject(new BridgeLifecycleError(503, "AGENT_TIMEOUT", "Agent session request timed out."));
+    }, command === "get_state" ? 30_000 : 15_000);
+    timer.unref?.();
+    g.pendingRpc.set(id, { command, resolve, reject, timer });
+    try {
+      transport.pi.send(JSON.stringify({ id, type: command, ...(sessionPath ? { sessionPath } : {}) }));
+    } catch {
+      clearTimeout(timer);
+      g.pendingRpc.delete(id);
+      reject(new BridgeLifecycleError(503, "AGENT_CLOSED", "Agent connection closed."));
+    }
+  });
+}
+
+export async function getCurrentTranscript(id: string, clientId: string) {
+  const w = workspaces.get(id);
+  if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
+  live(w, clientId);
+  const g = w.generation;
+  if (!g) error(410, "LEASE_RELEASED", "Agent was released");
+  if (runtimeMode() !== "local") return { apiVersion: "v1", supported: false as const };
+  if (g.busy) error(409, "AGENT_BUSY", "Agent is already processing a request");
+  const sequence = g.sequence;
+  const transport = g.transport;
+  if (!transport || transport.kind !== "local") error(503, "AGENT_CLOSED", "Local agent is not connected.");
+  const data = await requestLocalRpc(g, "get_entries");
+  const candidate = g.restoreCandidate;
+  const canRestore = candidate ? await transport.pi.canRestore(candidate) : false;
+  live(w, clientId);
+  check(w, g);
+  if (g.transport !== transport) error(503, "AGENT_CLOSED", "Agent connection changed while loading");
+  if (g.busy || g.sequence !== sequence) error(409, "AGENT_BUSY", "Agent session changed while loading");
+  return { apiVersion: "v1", supported: true as const, sequence, revision: g.revision, canRestore,
+    restoreNeedsMigration: canRestore && candidate?.version !== 3, messages: projectTranscript(data) };
+}
+
+export async function changeAgentSession(id: string, clientId: string, revision: string, action: "new" | "restore", confirmMigration = false) {
+  const w = workspaces.get(id);
+  if (!w) error(410, "LEASE_RELEASED", "Unknown lease");
+  live(w, clientId);
+  const g = w.generation;
+  if (!g) error(410, "LEASE_RELEASED", "Agent was released");
+  const transport = g.transport;
+  if (runtimeMode() !== "local" || !transport || transport.kind !== "local") error(501, "SESSION_UNSUPPORTED", "Session switching is unavailable");
+  if (revision !== g.revision) error(409, "SESSION_CHANGED", "Agent session changed");
+  if (g.busy || g.switchUncertain) error(409, "AGENT_BUSY", "Agent is already processing a request");
+
+  g.busy = true;
+  g.switching = true;
+  g.revision = randomUUID();
+  publishSnapshot(w, g);
+  let sent = false;
+  try {
+    const state = await requestLocalRpc(g, "get_state") as { sessionFile?: unknown; messageCount?: unknown };
+    check(w, g); live(w, clientId);
+    const entries = await requestLocalRpc(g, "get_entries");
+    check(w, g); live(w, clientId);
+    const persisted = await transport.pi.isPersisted(state?.sessionFile);
+    check(w, g); live(w, clientId);
+    if (!persisted && ((typeof state?.messageCount === "number" && state.messageCount > 0) ||
+        projectTranscript(entries).some((message) => message.role === "user"))) {
+      error(409, "SESSION_NOT_SAVED", "Current session has unpersisted messages");
+    }
+    const candidate = action === "new" ? await transport.pi.recentSession() : g.restoreCandidate;
+    check(w, g); live(w, clientId);
+    if (action === "restore") {
+      if (!candidate || !(await transport.pi.canRestore(candidate))) error(409, "SESSION_EXPIRED", "No recent session is available");
+      check(w, g); live(w, clientId);
+      if (candidate.version < 3 && !confirmMigration) error(409, "SESSION_MIGRATION_REQUIRED", "Old session requires confirmation");
+    }
+    sent = true;
+    const result = await requestLocalRpc(g, action === "new" ? "new_session" : "switch_session", action === "restore" ? candidate!.file : undefined) as { cancelled?: unknown };
+    check(w, g); live(w, clientId);
+    if (typeof result?.cancelled !== "boolean") throw new Error("Invalid session response");
+    if (!result.cancelled) {
+      g.restoreCandidate = action === "new" && candidate ? await transport.pi.refreshSession(candidate) : null;
+      check(w, g); live(w, clientId);
+      g.turn = null;
+      g.completed.clear();
+    }
+    return { apiVersion: "v1", cancelled: result.cancelled };
+  } catch (err) {
+    if (current(w, g) && sent) {
+      g.switchUncertain = true;
+      throw new BridgeLifecycleError(503, "AGENT_STATE_UNKNOWN", "Session state is unknown");
+    }
+    throw err;
+  } finally {
+    if (current(w, g)) {
+      g.switching = false;
+      if (!g.switchUncertain) g.busy = false;
+      publishSnapshot(w, g);
+    }
+  }
+}
+
 export function subscribe(id: string, clientId: string, onFrame: (frame: string) => void): (() => void) | null {
   const w = workspaces.get(id), l = w?.leases.get(clientId);
   if (!w || !l || l.released || w.fenced || !w.generation) return null;
@@ -388,7 +511,7 @@ function connect(id: string, w: Workspace, g: Generation): Promise<AgentConnect>
         return handle;
       } catch (err) {
         check(w, g);
-        if (Date.now() >= deadline) throw err;
+        if (mode === "local" || Date.now() >= deadline) throw err;
         await pause(Math.min(500 * 2 ** attempt++, 8000), g.controller.signal);
       }
     }
@@ -400,11 +523,22 @@ function connect(id: string, w: Workspace, g: Generation): Promise<AgentConnect>
 
 /** Normalize Pi events before exposing them to the owner of the active turn. */
 function deliver(w: Workspace, g: Generation, frame: string): void {
-  const t = g.turn;
-  if (!t || !g.busy || !t.sent) return;
   let event: Record<string, unknown>;
   try { event = JSON.parse(frame) as Record<string, unknown>; } catch { return; }
   if (!event || typeof event !== "object") return;
+  if (event.type === "response" && typeof event.id === "string") {
+    const pending = g.pendingRpc.get(event.id);
+    if (pending && event.command === pending.command) {
+      g.pendingRpc.delete(event.id);
+      clearTimeout(pending.timer);
+      if (event.success === true) pending.resolve(event.data);
+      else pending.reject(new BridgeLifecycleError(503, "AGENT_RPC_FAILED", "Agent request failed."));
+      return;
+    }
+  }
+  if (g.switching || g.switchUncertain) return;
+  const t = g.turn;
+  if (!t || !g.busy || !t.sent) return;
   if (event.type === "response" && event.command === "prompt" && event.id === t.promptId) {
     if (event.success !== true) {
       t.failed = true; t.settled = true;
@@ -502,11 +636,35 @@ async function openLocal(id: string, w: Workspace, g: Generation): Promise<Agent
   pi.onClose(() => {
     if (!current(w, g) || g.transport !== transport) return;
     g.transport = null;
-    if (g.turn && g.busy) markUncertain(w, g, g.turn);
+    rejectPendingRpc(g);
+    g.revision = randomUUID();
+    if (g.switching) { g.switching = false; g.switchUncertain = true; g.busy = true; }
+    else if (g.busy && g.turn) markUncertain(w, g, g.turn);
+    else if (!g.busy) { g.busy = true; g.switching = true; }
+    publishSnapshot(w, g);
     if ([...w.leases.values()].some(l => !l.released && l.subscribers.size)) {
       void Promise.resolve().then(() => { if (current(w, g)) return connect(id, w, g); }).catch(() => {});
     }
   });
+  try {
+    const state = await requestLocalRpc(g, "get_state") as { sessionFile?: unknown; model?: unknown };
+    check(w, g);
+    if (g.transport !== transport) throw new Error("Agent connection closed");
+    if (!state?.model || typeof state.model !== "object") throw new Error("Agent model unavailable");
+    const active = typeof state.sessionFile === "string" ? state.sessionFile : null;
+    g.restoreCandidate = await pi.recentSession(active);
+    check(w, g);
+    if (g.transport !== transport) throw new Error("Agent connection closed");
+    if (g.switching && !g.switchUncertain) {
+      g.switching = false;
+      g.busy = false;
+      publishSnapshot(w, g);
+    }
+  } catch {
+    if (g.transport === transport) g.transport = null;
+    await pi.terminate();
+    error(503, "AGENT_START_FAILED", "Local agent failed to start.");
+  }
   return { endpoint: "local:pi", token: "" };
 }
 

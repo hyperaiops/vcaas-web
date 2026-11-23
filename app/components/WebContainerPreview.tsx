@@ -29,6 +29,12 @@ function safePreviewText(value: unknown): string {
   return text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "").slice(0, 4000);
 }
 
+function safePreviewStack(value: string): string {
+  return safePreviewText(value).replace(/https?:\/\/[^\s)]+/g, (source) => {
+    try { const url = new URL(source); return url.origin + url.pathname; } catch { return "[无效地址]"; }
+  });
+}
+
 // WebContainer is a strict singleton per page. Booting twice throws
 // "Only a single WebContainer instance can be booted", so keep the instance
 // (and its one-time boot) outside the component.
@@ -72,6 +78,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
   useEffect(() => {
     let windowStart = 0;
     let count = 0;
+    let errorCount = 0;
     const onMessage = (event: MessageEvent) => {
       if (!previewUrlRef.current || event.source !== iframeRef.current?.contentWindow) return;
       let origin: string;
@@ -88,11 +95,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         }
         return;
       }
-      if ((data.level !== "log" && data.level !== "info" && data.level !== "warn") || typeof data.text !== "string" || data.text.length > 4000) return;
+      if ((data.level !== "log" && data.level !== "info" && data.level !== "warn" && data.level !== "error-location") || typeof data.text !== "string" || data.text.length > 4000) return;
       const now = Date.now();
-      if (now - windowStart >= 1000 || now < windowStart) { windowStart = now; count = 0; }
-      if (count++ >= 50) return;
-      terminalWriteRef.current?.(`[预览 ${data.level}] ${safePreviewText(data.text)}\r\n`);
+      if (now - windowStart >= 1000 || now < windowStart) { windowStart = now; count = 0; errorCount = 0; }
+      if ((data.level === "error-location" ? errorCount++ : count++) >= 50) return;
+      const label = data.level === "error-location" ? "错误位置" : data.level;
+      terminalWriteRef.current?.(`[预览 ${label}] ${safePreviewText(data.text)}\r\n`);
     };
     window.addEventListener("message", onMessage);
     return () => {
@@ -218,6 +226,10 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
           if (message.port !== previewPortRef.current) return;
           const detail = "message" in message ? safePreviewText(message.message) : message.args.slice(0, 10).map(safePreviewText).join(" ");
           writer?.(`[预览 error] ${detail.slice(0, 4000)}\r\n`);
+          if (message.stack) {
+            const stack = safePreviewStack(message.stack);
+            if (stack && stack !== detail) writer?.(`[预览堆栈] ${stack}\r\n`);
+          }
         }));
         unsubscribe.push(container.on("server-ready", (port, url) => {
           if (cancelled || stoppedRef.current || !startingServer) return;

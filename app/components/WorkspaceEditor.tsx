@@ -29,6 +29,7 @@ export default function WorkspaceEditor({ userName, canLogout = true }: { userNa
 
   const [isDesktop, setIsDesktop] = useState(false);
   const [status, setStatus] = useState<"loading" | "ready" | "missing">("loading");
+  const [maxFileBytes, setMaxFileBytes] = useState<number | null>(null);
 
   useEffect(() => {
     const check = () => setIsDesktop(window.innerWidth >= 1024);
@@ -52,6 +53,10 @@ export default function WorkspaceEditor({ userName, canLogout = true }: { userNa
           return;
         }
         if (!res.ok) throw new Error(`请求失败（${res.status}）`);
+        const manifest = await res.json();
+        if (cancelled) return;
+        const limit = manifest?.limits?.maxFileBytes;
+        setMaxFileBytes(Number.isSafeInteger(limit) && limit > 0 ? limit : null);
         setStatus("ready");
       } catch {
         if (!cancelled) setStatus("missing");
@@ -88,7 +93,7 @@ export default function WorkspaceEditor({ userName, canLogout = true }: { userNa
         <span className="brand-mark" aria-hidden="true">{'</>'}</span>
         <span className="whitespace-nowrap text-base font-extrabold tracking-tight sm:text-lg">随心一码<span className="text-[var(--brand-purple)]">.</span></span>
         <span className="hidden text-[13px] text-[var(--brand-muted)] md:inline">创作空间</span>
-        <span className="ml-auto hidden max-w-[12rem] truncate font-mono text-[13px] text-[#858b7d] lg:inline" title={workspaceId}>
+        <span className="hidden text-[13px] text-[var(--brand-muted)] md:inline" title={workspaceId}>
           {workspaceId}
         </span>
         <UserMenu name={userName} canLogout={canLogout} />
@@ -106,7 +111,7 @@ export default function WorkspaceEditor({ userName, canLogout = true }: { userNa
             className="min-h-0 min-w-0 flex-1 overflow-hidden lg:flex-none"
             style={isDesktop ? { width: "33.33%" } : undefined}
           >
-            <AgentPanel workspaceId={workspaceId} />
+            <AgentPanel workspaceId={workspaceId} maxFileBytes={maxFileBytes} />
           </section>
 
           {/* Visual divider — fixed, not draggable */}

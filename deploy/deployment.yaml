@@ -82,7 +82,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: webcontainer
-          image: ccr.ccs.tencentyun.com/vcaas/platform:release-20261115-163329
+          image: ccr.ccs.tencentyun.com/vcaas/platform:release-20261115-164432
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:
@@ -130,6 +130,12 @@ spec:
               value: /app/.data/snapshots
             - name: TEMPLATE_DIR
               value: /app/template
+            # Limits in bytes: 10 MiB per file, 50 MiB per workspace.
+            # Keep upstream ingress/proxy body limits at least as large as the file limit.
+            - name: WORKSPACE_MAX_FILE_BYTES
+              value: "10485760"
+            - name: WORKSPACE_MAX_TOTAL_BYTES
+              value: "52428800"
             # Reserved for the separate PVC/subPath integration.
             - name: PI_WORKSPACE_PVC_NAME
               value: my-agent-workspace

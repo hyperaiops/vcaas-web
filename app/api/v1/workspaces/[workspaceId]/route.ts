@@ -5,6 +5,7 @@ import { findSnapshot, SNAPSHOT_FORMAT } from "@/app/lib/workspace/snapshot";
 import { deleteWorkspace } from "@/app/lib/db";
 import { requireOwnedWorkspace } from "@/app/lib/auth/access";
 import { forceShutdown } from "@/app/lib/bridge/session";
+import { getWorkspaceLimits } from "@/app/lib/workspace/limits";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +33,7 @@ export async function GET(_request: Request, { params }: Context) {
   return jsonResponse({
     apiVersion: "v1",
     workspace: { id: workspace.id, revision: tree.revision },
+    limits: getWorkspaceLimits(),
     defaultMountSource: snapshot ? "snapshot" : "tree",
     mountSources: {
       tree: { status: "ready", href: `${base}/tree`, mediaType: "application/vnd.webcontainer.tree+json", sizeBytes: tree.sizeBytes },

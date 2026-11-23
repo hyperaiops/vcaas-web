@@ -56,6 +56,7 @@ function harness(options: { ensure?: (signal: AbortSignal) => Promise<Handle>; r
     "server-only": {}, "node:crypto": { randomUUID: () => "request-id" }, "node:tls": {}, ws: Socket,
     "@/app/lib/bridge/runtime": { runtimeMode: () => "prod", BridgeLifecycleError: TestLifecycleError },
     "@/app/lib/bridge/local": { LocalPiTransport: class {} },
+    "@/app/lib/bridge/transcript": { projectTranscript: () => [] },
     "@/app/lib/bridge/k8s": {
       ensurePiWorker: async (_id: string, signal: AbortSignal) => {
         ensureCalls++; signals.push(signal); order.push("ensure");

@@ -188,22 +188,46 @@ Kubernetes permissions. Verify the per-workspace NFS/PVC mount isolation before
 enabling agents for untrusted users; Service RPC transport alone does not provide
 filesystem isolation.
 
+### 附件及工作区大小限制
+
+在 `.env.local`（本地）或 `deploy/deployment.yaml`（Kubernetes）中配置：
+
+- `WORKSPACE_MAX_FILE_BYTES`：单个文件上限，默认 `10485760` 字节（10 MiB）。
+- `WORKSPACE_MAX_TOTAL_BYTES`：工作区所有非忽略文件的总大小上限，默认 `52428800` 字节（50 MiB），必须不小于单文件上限。
+
+单位均为字节，1 MiB = 1,048,576 字节；附件以原始二进制上传，不会按 UTF-8 重编码。工作区总大小也包含代码和 `.attachments/`。上传附件时会检查总上限，避免附件使工作区无法生成文件树或快照；工作区中的 agent 进程可能同时改动文件，因此应用内检查不是跨进程的存储配额。快照生成另有 100 MiB 的输出上限，调大工作区总上限时也要考虑此限制及服务内存。
+
+应用环境变量只控制应用，不控制上游网关。`deploy/ingress.yaml` 使用 Traefik，当前清单没有设置请求体大小上限；如果 413 响应来自网关，请检查实际部署的 Traefik middleware、负载均衡器和其他前置代理，将它们的请求体上限至少设为单文件上限。修改环境变量后须重启本地服务或更新 Kubernetes Deployment，并确保浏览器加载新版前端。
+
 ### Agent 运行模式（local / prod）
 
 项目通过显式的 `PI_RUNTIME_MODE` 只保留两种运行模式（必须配置，不自动猜测）：
 
 - **`PI_RUNTIME_MODE=local`**（本地开发）：在服务端启动本机
-  `pi --mode rpc --no-session --provider litellm`，工作目录为该工作区在本机磁盘上的
-  目录，直接读写本地文件。LiteLLM API key 写入 0600 权限的临时密钥文件后按路径传入，
-  不出现在命令行或常规环境变量中，进程退出时删除。pi 的 HOME 隔离在
-  `.data/pi-home/<workspaceId>`（可用 `PI_LOCAL_HOME_ROOT` 覆盖）。`PI_BIN` 可指定
-  二进制路径（默认 `pi`）。`NODE_ENV=production` 时该模式被拒绝——生产服务器绝不
-  运行本地编码 CLI。
+  `pi --mode rpc --provider litellm`，工作目录为该工作区在本机磁盘上的目录，直接
+  读写本地文件。页面提供新建和恢复上次会话图标；仅可恢复最后修改时间在过去
+  24 小时内的会话，不提供历史列表。启动时自动恢复符合条件的最近一次会话，否则
+  开始新会话。session 默认保存在宿主机用户的 `~/.pi/agent/sessions/` 对应 cwd
+  目录，可用 `PI_LOCAL_SESSION_ROOT` 覆盖根目录。只恢复 session 头部 cwd 与当前
+  工作区一致的记录，不会恢复其他项目。旧版本 session 可能被 Pi 迁移，自动恢复会
+  跳过旧格式；手动恢复需确认。删除工作区不会删除宿主机上的 Pi session 文件；
+  已有本机模式使用 `--no-session` 产生的聊天未曾持久化，无法追溯恢复。
+
+  应用自动为本机 Pi 创建临时隔离配置并注册 LiteLLM provider。API key 写入 0600
+  临时文件，不出现在命令行或常规环境变量中；进程退出时清理配置和密钥。
+  `PI_BIN` 可指定二进制路径（默认 `pi`）。`NODE_ENV=production` 时该模式被拒绝——
+  生产服务器绝不运行本地编码 CLI。
+
+  恢复依赖 Pi 已写入的 session：首次 assistant 消息之前 Pi 可能还未创建文件；刚新建
+  的空会话若重新打开，可能自动恢复之前已保存的会话。强制退出也可能丢失尚未落盘的
+  消息和流式内容。断线后的未知请求不会自动重放。不要同时用独立 Pi 进程写入同一个
+  工作区 session。
+
 - **`PI_RUNTIME_MODE=prod`**（线上部署，`deploy/deployment.yaml` 已设置）：webcontainer 后端
   使用每个 PiWorker 的 `status.serviceName`，通过
   `ws://<serviceName>.<PI_NAMESPACE>.svc:8080/v1/rpc` 连接 agent，不使用 Ingress
   endpoint，也没有 endpoint 模式或 TLS 转发配置。Bearer token 认证和项目归属检查
-  保持不变，token 不交给浏览器。
+  保持不变，token 不交给浏览器。PiWorker 的持久会话恢复尚未实现。
 
 prod 连接链路为：浏览器 → webcontainer 后端 → PiWorker ClusterIP Service → agent。
 `kubectl port-forward svc/webcontainer 3000:3000` 只转发 Web UI；RPC 仍从集群内的

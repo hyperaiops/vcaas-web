@@ -2,7 +2,7 @@
 //
 // Forwards a user message to the agent as a Pi `prompt` RPC command over the
 // server-side ws. The assistant's streamed response is read from the sibling
-// `events` SSE route. Body: { clientId: string, turnId: string, message: string }.
+// `events` SSE route. Body: { clientId, turnId, message, revision }.
 
 import { requireOwnedWorkspace } from "@/app/lib/auth/access";
 import { sendPrompt } from "@/app/lib/bridge/session";
@@ -26,7 +26,7 @@ export async function POST(request: Request, { params }: Context) {
     return errorResponse(400, "EMPTY_PROMPT", "请输入消息。");
   }
   try {
-    await sendPrompt(workspaceId, body.clientId, message, body.turnId);
+    await sendPrompt(workspaceId, body.clientId, message, body.turnId, typeof body.revision === "string" ? body.revision : undefined);
     return jsonResponse({ apiVersion: "v1", sent: true });
   } catch (error) {
     return agentError(error, 503, "AGENT_SEND_FAILED", "无法发送消息给智能助手，请稍后重试。");

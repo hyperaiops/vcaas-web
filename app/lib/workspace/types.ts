@@ -32,6 +32,7 @@ export type WorkspaceManifest = {
   workspace: { id: string; revision: string };
   defaultMountSource: "tree" | "snapshot";
   mountSources: { tree: MountSource; snapshot: MountSource };
+  limits: WorkspaceLimits;
 };
 
 export type WorkspaceRow = {
@@ -53,8 +54,8 @@ export type WorkspaceLimits = {
 export const DEFAULT_LIMITS: WorkspaceLimits = {
   maxFiles: 10_000,
   maxDepth: 32,
-  maxFileBytes: 1024 * 1024,
-  maxTotalBytes: 20 * 1024 * 1024,
+  maxFileBytes: 10 * 1024 * 1024,
+  maxTotalBytes: 50 * 1024 * 1024,
 };
 
 // Mirrors Go's httpapi.ValidWorkspaceID: lowercase letters, digits, hyphens;
