@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { authenticatedFetch } from "@/app/lib/auth/client";
 import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
+import IconTooltip from "./IconTooltip";
 
 // Monaco is large — only load the code editor when the Code tab is opened.
 const CodeEditor = dynamic(() => import("@/app/components/CodeEditor"), {
@@ -21,7 +22,28 @@ type ConsoleSize = "hidden" | "compact" | "expanded";
 type Status = "booting" | "loading" | "installing" | "starting" | "ready" | "stopped" | "error";
 
 const WORKSPACE_ID_FALLBACK = "workspace";
-const PACKAGE_MANAGER_ENV = { npm_config_registry: "https://registry.npmmirror.com/" };
+const PACKAGE_MANAGER_ENV = { npm_config_registry: "https://mirrors.cloud.tencent.com/npm/" };
+
+type BridgeProbe = {
+  nonce: string; origin: string; connected: boolean; lastSent: number;
+  retry: ReturnType<typeof setInterval> | null; timeout: ReturnType<typeof setTimeout> | null;
+};
+
+function clearBridgeProbe(ref: { current: BridgeProbe | null }) {
+  const probe = ref.current;
+  if (probe?.retry != null) clearInterval(probe.retry);
+  if (probe?.timeout != null) clearTimeout(probe.timeout);
+  ref.current = null;
+}
+
+function sendBridgeProbe(probe: BridgeProbe, iframe: HTMLIFrameElement | null) {
+  const now = Date.now();
+  if (now >= probe.lastSent && now - probe.lastSent < 500) return;
+  probe.lastSent = now;
+  try {
+    iframe?.contentWindow?.postMessage({ type: "webcontainer-preview-probe", version: 1, nonce: probe.nonce }, probe.origin);
+  } catch { /* The iframe may be navigating. */ }
+}
 
 function safePreviewText(value: unknown): string {
   let text: string;
@@ -57,9 +79,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
   const terminalWriteRef = useRef<((message: string) => void) | null>(null);
   const previewUrlRef = useRef<string | null>(null);
   const previewPortRef = useRef<number | null>(null);
-  const bridgeReadyRef = useRef(0);
-  const bridgeLastLoadRef = useRef(0);
-  const bridgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bridgeProbeRef = useRef<BridgeProbe | null>(null);
   const bridgeInstalledRef = useRef(false);
   const [consoleSize, setConsoleSize] = useState<ConsoleSize>("compact");
   const [status, setStatus] = useState<Status>("booting");
@@ -84,15 +104,21 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
       let origin: string;
       try { origin = new URL(previewUrlRef.current).origin; } catch { return; }
       if (event.origin !== origin || !event.data || typeof event.data !== "object") return;
-      const data = event.data as { type?: unknown; version?: unknown; level?: unknown; text?: unknown };
+      const data = event.data as { type?: unknown; version?: unknown; level?: unknown; text?: unknown; nonce?: unknown };
       if (data.type !== "webcontainer-preview-console" || data.version !== 1) return;
       if (data.level === "ready") {
-        bridgeReadyRef.current++;
-        if (bridgeTimerRef.current) {
-          clearTimeout(bridgeTimerRef.current);
-          bridgeTimerRef.current = null;
-          bridgeLastLoadRef.current = bridgeReadyRef.current;
+        const probe = bridgeProbeRef.current;
+        if (!probe || event.origin !== probe.origin) return;
+        if (data.nonce === undefined && !probe.connected) {
+          sendBridgeProbe(probe, iframeRef.current);
+          return;
         }
+        if (data.nonce !== probe.nonce) return;
+        if (probe.retry !== null) clearInterval(probe.retry);
+        if (probe.timeout !== null) clearTimeout(probe.timeout);
+        probe.retry = null;
+        probe.timeout = null;
+        probe.connected = true;
         return;
       }
       if ((data.level !== "log" && data.level !== "info" && data.level !== "warn" && data.level !== "error-location") || typeof data.text !== "string" || data.text.length > 4000) return;
@@ -105,8 +131,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     window.addEventListener("message", onMessage);
     return () => {
       window.removeEventListener("message", onMessage);
-      if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
-      bridgeTimerRef.current = null;
+      clearBridgeProbe(bridgeProbeRef);
     };
   }, []);
 
@@ -118,6 +143,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     let shell: WebContainerProcess | null = null;
     let dev: WebContainerProcess | null = null;
     let startingServer = false;
+    let previewGeneration = 0;
     let terminal: { write(data: string): void; dispose(): void } | null = null;
     let observer: ResizeObserver | null = null;
     let writer: ((message: string) => void) | null = null;
@@ -166,11 +192,8 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         stoppedRef.current = false;
         previewUrlRef.current = null;
         previewPortRef.current = null;
-        bridgeReadyRef.current = 0;
-        bridgeLastLoadRef.current = 0;
         bridgeInstalledRef.current = false;
-        if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
-        bridgeTimerRef.current = null;
+        clearBridgeProbe(bridgeProbeRef);
         setStatus("booting");
         setPreviewUrl(null);
         setError(null);
@@ -225,6 +248,16 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         unsubscribe.push(container.on("preview-message", (message) => {
           if (message.port !== previewPortRef.current) return;
           const detail = "message" in message ? safePreviewText(message.message) : message.args.slice(0, 10).map(safePreviewText).join(" ");
+          if (message.type === "PREVIEW_UNCAUGHT_EXCEPTION" && detail === "Uncaught SyntaxError: Unexpected end of input") {
+            const firstFrame = message.stack?.split(/\r?\n/).find((line) => line.trimStart().startsWith("at "));
+            const frameUrl = firstFrame?.match(/https?:\/\/[^\s)]+/)?.[0].replace(/:\d+(?::\d+)?$/, "");
+            try {
+              if (frameUrl && previewUrlRef.current) {
+                const source = new URL(frameUrl);
+                if (source.origin === new URL(previewUrlRef.current).origin && source.pathname === "/.webcontainer@wc-api-script.js") return;
+              }
+            } catch { /* Unknown sources remain visible. */ }
+          }
           writer?.(`[预览 error] ${detail.slice(0, 4000)}\r\n`);
           if (message.stack) {
             const stack = safePreviewStack(message.stack);
@@ -233,15 +266,23 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         }));
         unsubscribe.push(container.on("server-ready", (port, url) => {
           if (cancelled || stoppedRef.current || !startingServer) return;
-          previewPortRef.current = port;
+          const generation = ++previewGeneration;
+          const showPreview = () => {
+            if (cancelled || stoppedRef.current || generation !== previewGeneration) return;
+            if (previewUrlRef.current !== url) clearBridgeProbe(bridgeProbeRef);
+            previewPortRef.current = port;
+            previewUrlRef.current = url;
+            setPreviewUrl(url);
+            setStatus("ready");
+          };
           // Wait briefly for the listener before rendering the iframe.
           void (async () => {
             for (let attempt = 0; attempt < 20; attempt++) {
-              if (cancelled || stoppedRef.current) return;
+              if (cancelled || stoppedRef.current || generation !== previewGeneration) return;
               try {
                 const probe = await fetch(url, { mode: "no-cors", cache: "no-store", signal: controller.signal });
                 if (probe) {
-                  if (!cancelled && !stoppedRef.current) { previewUrlRef.current = url; setPreviewUrl(url); setStatus("ready"); }
+                  showPreview();
                   return;
                 }
               } catch {
@@ -249,7 +290,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
               }
               await new Promise((resolve) => setTimeout(resolve, 400));
             }
-            if (!cancelled && !stoppedRef.current) { previewUrlRef.current = url; setPreviewUrl(url); setStatus("ready"); }
+            showPreview();
           })();
         }));
         try {
@@ -259,7 +300,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
           if (cancelled) return;
           bridgeInstalledRef.current = true;
         } catch {
-          writer?.("[系统] 无法启用预览页面日志转发，进程日志仍可使用。\r\n");
+          // The optional preview log bridge must not interrupt the app or process logs.
         }
         if (cancelled) return;
 
@@ -331,6 +372,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     return () => {
       cancelled = true;
       controller.abort();
+      clearBridgeProbe(bridgeProbeRef);
       observer?.disconnect();
       for (const off of unsubscribe) off();
       for (const process of processes) {
@@ -408,6 +450,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
 
   function refresh() {
     if (status !== "ready" && status !== "error" && status !== "stopped") return;
+    clearBridgeProbe(bridgeProbeRef);
     setRefreshKey((k) => k + 1);
   }
 
@@ -419,8 +462,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     devRef.current = null;
     previewUrlRef.current = null;
     previewPortRef.current = null;
-    if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
-    bridgeTimerRef.current = null;
+    clearBridgeProbe(bridgeProbeRef);
     terminalWriteRef.current?.("[系统] 开发服务器已停止。\r\n");
     setPreviewUrl(null);
     setStatus("stopped");
@@ -431,20 +473,24 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
   const terminalHeight = consoleSize === "expanded" ? "50%" : "clamp(80px, 25%, 150px)";
 
   function onPreviewLoad() {
-    if (!bridgeInstalledRef.current) return;
-    if (bridgeTimerRef.current) clearTimeout(bridgeTimerRef.current);
-    if (bridgeReadyRef.current > bridgeLastLoadRef.current) {
-      bridgeLastLoadRef.current = bridgeReadyRef.current;
-      bridgeTimerRef.current = null;
-      return;
-    }
-    const previous = bridgeReadyRef.current;
-    bridgeTimerRef.current = setTimeout(() => {
-      bridgeTimerRef.current = null;
-      if (bridgeReadyRef.current === previous && previewUrlRef.current) {
-        terminalWriteRef.current?.("[系统] 预览页面日志未连接，可能被页面安全策略或网络阻止；进程日志不受影响。\r\n");
-      }
+    clearBridgeProbe(bridgeProbeRef);
+    if (!bridgeInstalledRef.current || !previewUrlRef.current || !iframeRef.current?.contentWindow) return;
+    let origin: string;
+    try { origin = new URL(previewUrlRef.current).origin; } catch { return; }
+    const probe: BridgeProbe = { nonce: crypto.randomUUID(), origin, connected: false, lastSent: -Infinity, retry: null, timeout: null };
+    bridgeProbeRef.current = probe;
+    const send = () => {
+      if (bridgeProbeRef.current === probe && !probe.connected && probe.retry !== null) sendBridgeProbe(probe, iframeRef.current);
+    };
+    probe.retry = setInterval(send, 500);
+    probe.timeout = setTimeout(() => {
+      if (bridgeProbeRef.current !== probe || probe.connected) return;
+      if (probe.retry !== null) clearInterval(probe.retry);
+      probe.retry = null;
+      probe.timeout = null;
+      probe.lastSent = -Infinity;
     }, 5000);
+    send();
   }
 
   return (
@@ -453,25 +499,25 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         {/* Preview / Code tab toggle */}
         <div className="flex shrink-0 rounded-md border border-[#cbd1c0] bg-white p-0.5">
           {(["preview", "code"] as const).map((candidate) => (
-            <button
-              key={candidate}
-              type="button"
-              onClick={() => setView(candidate)}
-              aria-label={candidate === "preview" ? "预览" : "代码"}
-              aria-pressed={view === candidate}
-              title={candidate === "preview" ? "预览" : "代码"}
-              className={`flex h-10 w-10 items-center justify-center rounded ${
-                view === candidate ? "bg-[var(--brand-ink)] text-white" : "text-[var(--brand-muted)] hover:bg-[#eff5d9]"
-              }`}
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
-                {candidate === "preview" ? (
-                  <><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M8 21h8M12 18v3" /></>
-                ) : (
-                  <><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16" /></>
-                )}
-              </svg>
-            </button>
+            <IconTooltip key={candidate} align="left" label={candidate === "preview" ? "预览" : "查看源码"}>
+              <button
+                type="button"
+                onClick={() => setView(candidate)}
+                aria-label={candidate === "preview" ? "预览" : "查看源码"}
+                aria-pressed={view === candidate}
+                className={`flex h-10 w-10 items-center justify-center rounded ${
+                  view === candidate ? "bg-[var(--brand-ink)] text-white" : "text-[var(--brand-muted)] hover:bg-[#eff5d9]"
+                }`}
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                  {candidate === "preview" ? (
+                    <><rect x="3" y="4" width="18" height="14" rx="2" /><path d="M8 21h8M12 18v3" /></>
+                  ) : (
+                    <><path d="m8 7-5 5 5 5M16 7l5 5-5 5M14 4l-4 16" /></>
+                  )}
+                </svg>
+              </button>
+            </IconTooltip>
           ))}
         </div>
         {view === "preview" && (
@@ -484,43 +530,46 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
           <>
             <div className="ml-auto" />
             {status === "ready" && (
+              <IconTooltip label="停止开发服务器（保留 WebContainer）">
+                <button
+                  type="button"
+                  onClick={stop}
+                  aria-label="停止服务"
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-red-300 text-red-600 hover:bg-red-50"
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" className="h-4 w-4" aria-hidden="true">
+                    <rect x="6" y="6" width="12" height="12" rx="1" />
+                  </svg>
+                </button>
+              </IconTooltip>
+            )}
+            <IconTooltip label={status === "stopped" ? "启动服务" : "刷新：重新挂载工作区并重启开发服务器"}>
               <button
                 type="button"
-                onClick={stop}
-                aria-label="停止服务"
-                title="停止开发服务器（保留 WebContainer）"
-                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-red-300 text-red-600 hover:bg-red-50"
+                onClick={refresh}
+                disabled={status !== "ready" && status !== "error" && status !== "stopped"}
+                aria-label={status === "stopped" ? "启动服务" : "重新启动"}
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:pointer-events-none disabled:opacity-40"
               >
-                <svg viewBox="0 0 24 24" fill="currentColor" className="h-4 w-4" aria-hidden="true">
-                  <rect x="6" y="6" width="12" height="12" rx="1" />
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                  {status === "stopped" ? <path d="m8 5 11 7-11 7z" /> : <><path d="M20 7v5h-5" /><path d="M20 12a8 8 0 1 0-2.3 5.7" /></>}
                 </svg>
               </button>
-            )}
-            <button
-              type="button"
-              onClick={refresh}
-              disabled={status !== "ready" && status !== "error" && status !== "stopped"}
-              aria-label={status === "stopped" ? "启动服务" : "重新启动"}
-              title={status === "stopped" ? "启动服务" : "重新挂载工作区并重启开发服务器"}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
-                {status === "stopped" ? <path d="m8 5 11 7-11 7z" /> : <><path d="M20 7v5h-5" /><path d="M20 12a8 8 0 1 0-2.3 5.7" /></>}
-              </svg>
-            </button>
-            <button
-              type="button"
-              onClick={() => setConsoleSize((size) => size === "hidden" ? "compact" : "hidden")}
-              aria-label={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}
-              aria-expanded={consoleSize !== "hidden"}
-              aria-controls="preview-console"
-              title={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}
-              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9]"
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
-                <rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M12 15h5" />
-              </svg>
-            </button>
+            </IconTooltip>
+            <IconTooltip label={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}>
+              <button
+                type="button"
+                onClick={() => setConsoleSize((size) => size === "hidden" ? "compact" : "hidden")}
+                aria-label={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}
+                aria-expanded={consoleSize !== "hidden"}
+                aria-controls="preview-console"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9]"
+              >
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="16" rx="2" /><path d="m7 9 3 3-3 3M12 15h5" />
+                </svg>
+              </button>
+            </IconTooltip>
           </>
         )}
       </div>
@@ -548,26 +597,28 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--brand-line)] bg-[#f0f2e9] px-3">
           <span className="text-[#799b39]" aria-hidden="true">●</span>
           <span className="text-[13px] font-bold text-[var(--brand-ink)]">终端</span>
-          <button
-            type="button"
-            onClick={() => setConsoleSize((size) => size === "expanded" ? "compact" : "expanded")}
-            aria-label={consoleSize === "expanded" ? "收起终端" : "展开终端"}
-            title={consoleSize === "expanded" ? "收起终端" : "展开终端"}
-            className="ml-auto flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
-              {consoleSize === "expanded" ? <path d="m7 10 5 5 5-5" /> : <path d="m7 14 5-5 5 5" />}
-            </svg>
-          </button>
-          <button
-            type="button"
-            onClick={() => setConsoleSize("hidden")}
-            aria-label="隐藏终端"
-            title="隐藏终端"
-            className="flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="h-4 w-4" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
-          </button>
+          <IconTooltip className="ml-auto" label={consoleSize === "expanded" ? "收起终端" : "展开终端"}>
+            <button
+              type="button"
+              onClick={() => setConsoleSize((size) => size === "expanded" ? "compact" : "expanded")}
+              aria-label={consoleSize === "expanded" ? "收起终端" : "展开终端"}
+              className="flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+                {consoleSize === "expanded" ? <path d="m7 10 5 5 5-5" /> : <path d="m7 14 5-5 5 5" />}
+              </svg>
+            </button>
+          </IconTooltip>
+          <IconTooltip label="隐藏终端">
+            <button
+              type="button"
+              onClick={() => setConsoleSize("hidden")}
+              aria-label="隐藏终端"
+              className="flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="h-4 w-4" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </IconTooltip>
         </div>
         <div ref={terminalRef} className="min-h-0 flex-1 bg-white px-2 py-1" />
       </div>

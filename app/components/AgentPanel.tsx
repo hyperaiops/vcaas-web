@@ -2,11 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { authenticatedFetch } from "@/app/lib/auth/client";
+import { MAX_COMMAND_BYTES, MAX_HISTORY_DETAIL_BYTES, MAX_PATH_BYTES, MAX_TURN_DETAIL_BYTES, type Activity, type ActivityMetrics } from "@/app/lib/bridge/activity-types";
+import IconTooltip from "./IconTooltip";
 
 type TurnPhase = "running" | "retrying" | "compacting" | "stopping" | "uncertain" | "done" | "stopped" | "failed";
-type Activity = { id: string; name: string; status: "running" | "done" | "failed" };
 type Message = {
   id: number;
+  sourceId?: string;
+  turnId?: string;
   role: "user" | "agent";
   text: string;
   streaming?: boolean;
@@ -18,7 +21,7 @@ type Message = {
 
 type TurnSnapshot = { id: string; text: string; phase: TurnPhase; activities: Activity[]; truncated?: boolean };
 type PiEvent =
-  | { type: "turn_snapshot"; version: 1; sequence: number; busy: boolean; revision: string; switching: boolean; uncertain: boolean; turn?: TurnSnapshot }
+  | { type: "turn_snapshot"; version: 1; sequence: number; busy: boolean; revision: string; revisionReason?: "initial" | "session" | "transport"; switching: boolean; uncertain: boolean; otherTurnLatest?: boolean; turn?: TurnSnapshot }
   | { type: "turn_event"; version: 1; sequence: number; turnId: string; event:
       | { kind: "text"; delta: string }
       | { kind: "phase"; phase: TurnPhase }
@@ -26,9 +29,73 @@ type PiEvent =
 
 const isFinished = (phase: TurnPhase) => phase === "done" || phase === "stopped" || phase === "failed";
 const activityLabel = (name: string) => ({
-  read: "读取文件", write: "创建文件", edit: "修改文件", bash: "执行命令",
+  read: "读取文件", write: "写入文件", edit: "修改文件", bash: "执行命令",
   grep: "搜索内容", find: "查找文件", ls: "查看文件",
 } as Record<string, string>)[name] ?? "执行操作";
+
+function activityMetricsLabel(metrics?: ActivityMetrics): string {
+  if (!metrics) return "";
+  return [
+    metrics.offset !== undefined ? `从第 ${metrics.offset} 行开始` : "",
+    metrics.limit !== undefined ? `最多 ${metrics.limit} 行` : "",
+    metrics.editCount !== undefined ? `${metrics.editCount} 处修改` : "",
+    metrics.writeBytes !== undefined ? `${metrics.writeBytes.toLocaleString("en-US")} 字节` : "",
+    metrics.timeout !== undefined ? `超时 ${metrics.timeout} 秒` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+function hasUnsafeControls(value: string): boolean {
+  for (const char of value) {
+    const code = char.codePointAt(0)!;
+    if ((code < 32 && code !== 9 && code !== 10) || (code >= 0x7f && code <= 0x9f) ||
+        (code >= 0x202a && code <= 0x202e) || (code >= 0x2066 && code <= 0x2069) ||
+        code === 0x061c || code === 0x200e || code === 0x200f || (code >= 0xd800 && code <= 0xdfff)) return true;
+  }
+  return false;
+}
+
+function parseActivities(value: unknown): Activity[] | undefined {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.length > 100) throw new Error("invalid activities");
+  let detailBytes = 0;
+  return value.map((item: unknown) => {
+    if (!item || typeof item !== "object" || !("id" in item) || typeof item.id !== "string" || !item.id || item.id.length > 200 ||
+        !("name" in item) || typeof item.name !== "string" || item.name.length > 32 || !("status" in item) ||
+        (item.status !== "running" && item.status !== "done" && item.status !== "failed" && item.status !== "unknown")) throw new Error("invalid activity");
+    let detail: Activity["detail"];
+    if ("detail" in item && item.detail !== undefined) {
+      const value = item.detail;
+      if (!value || typeof value !== "object" || !("kind" in value) || !("value" in value) ||
+          (value.kind !== "path" && value.kind !== "command") || typeof value.value !== "string" ||
+          value.value.length > (value.kind === "command" ? MAX_COMMAND_BYTES : MAX_PATH_BYTES) || hasUnsafeControls(value.value) ||
+          new TextEncoder().encode(value.value).length > (value.kind === "command" ? MAX_COMMAND_BYTES : MAX_PATH_BYTES) ||
+          ("truncated" in value && value.truncated !== true) || ("escaped" in value && value.escaped !== true)) throw new Error("invalid activity detail");
+      detailBytes += new TextEncoder().encode(value.value).length;
+      if (detailBytes > MAX_TURN_DETAIL_BYTES) throw new Error("activity details too large");
+      detail = { kind: value.kind, value: value.value, ...("truncated" in value ? { truncated: true as const } : {}), ...("escaped" in value ? { escaped: true as const } : {}) };
+    }
+    let metrics: ActivityMetrics | undefined;
+    if ("metrics" in item && item.metrics !== undefined) {
+      if (!item.metrics || typeof item.metrics !== "object" || Array.isArray(item.metrics)) throw new Error("invalid activity metrics");
+      const values = item.metrics as Record<string, unknown>;
+      metrics = {};
+      for (const key of ["offset", "limit", "editCount", "writeBytes", "timeout"] as const) {
+        const value = values[key];
+        if (value === undefined) continue;
+        if (typeof value !== "number" || !Number.isFinite(value) || value < 0 ||
+            (key !== "timeout" && !Number.isSafeInteger(value)) || (key === "timeout" && value > 2147483)) throw new Error("invalid activity metric");
+        metrics[key] = value;
+      }
+    }
+    if ("detailTruncated" in item && item.detailTruncated !== true && item.detailTruncated !== undefined) throw new Error("invalid activity truncation");
+    return { id: item.id, name: item.name, status: item.status, ...(detail ? { detail } : {}),
+      ...(metrics ? { metrics } : {}), ...("detailTruncated" in item && item.detailTruncated === true ? { detailTruncated: true as const } : {}) };
+  });
+}
+
+function activityKey(message: Message): string {
+  return message.turnId ? `turn:${message.turnId}` : message.sourceId ? `history:${message.sourceId}` : `message:${message.id}`;
+}
 
 type ConnState = "connecting" | "open" | "closed" | "error";
 
@@ -76,9 +143,11 @@ type Activation = {
   ready: boolean;
   streamingId: number | null;
   turnId: string | null;
+  lastTurnId: string | null;
   sequence: number;
   revision: string | null;
   sessionActionPending: boolean;
+  sessionActionRevision: string | null;
   cancelPending: boolean;
   historyReady: boolean;
   historyLoading: boolean;
@@ -91,6 +160,10 @@ type Activation = {
 };
 
 const agentBase = (wid: string) => `/api/v1/workspaces/${encodeURIComponent(wid)}/agent`;
+const SEND_UNCERTAIN_NOTICE = "发送状态暂时未知，可尝试停止并等待连接恢复。";
+const STOP_UNCERTAIN_NOTICE = "停止请求未确认，请重试。";
+const HISTORY_UNCONFIRMED_NOTICE = "暂时无法核对本地回复与历史记录，当前内容已保留。";
+const SESSION_MISMATCH_NOTICE = "其他页面已切换会话；为避免丢失，当前回复仍保留。请复制需要的内容后刷新页面。";
 const welcome: Message = {
   id: 0,
   role: "agent",
@@ -118,9 +191,19 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
   const [sessionSwitching, setSessionSwitching] = useState(false);
   const [sessionActionPending, setSessionActionPending] = useState(false);
   const [sessionUncertain, setSessionUncertain] = useState(false);
+  const [sessionMismatch, setSessionMismatch] = useState(false);
   const [sessionNotice, setSessionNotice] = useState("");
+  const [activityOpen, setActivityOpen] = useState<Record<string, boolean>>({});
+  const [historyActivityTruncated, setHistoryActivityTruncated] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const retainedTurnRef = useRef<string | null>(null);
+  const pendingTurnsRef = useRef(new Set<string>());
+  const unconfirmedTurnRef = useRef<string | null>(null);
+  const sessionMismatchRef = useRef(false);
+  const historyTurnIdsRef = useRef(new Map<string, string>());
+  const latestActivityKeyRef = useRef<string | null>(null);
   const idRef = useRef(1);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // The server holds the authenticated WebSocket to the agent; the browser
@@ -137,7 +220,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
 
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
   useEffect(() => {
@@ -206,16 +289,52 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
             (body.sequence < lease.sequence || (body.sequence === lease.sequence && body.revision !== lease.revision));
           return;
         }
-        const restored: Message[] = body.messages.map((item: unknown) => {
-          if (!item || typeof item !== "object" || !("role" in item) || !("text" in item) ||
-              (item.role !== "user" && item.role !== "agent") || typeof item.text !== "string") throw new Error("invalid history message");
-          return { id: idRef.current++, role: item.role, text: item.text };
-        });
-        setMessages(restored.length ? restored : [welcome]);
         setSessionSupported(true);
         setCanRestore(body.canRestore);
         setRestoreNeedsMigration("restoreNeedsMigration" in body && body.restoreNeedsMigration === true);
         lease.historySupported = true;
+        const matchedIndex = "reconciledTurnId" in body && body.reconciledTurnId === lease.lastTurnId &&
+          "reconciledIndex" in body && typeof body.reconciledIndex === "number" && Number.isSafeInteger(body.reconciledIndex)
+          ? body.reconciledIndex : -1;
+        const matchedItem: unknown = matchedIndex >= 0 ? body.messages[matchedIndex] : null;
+        const matched = !!lease.lastTurnId && !!matchedItem && typeof matchedItem === "object" &&
+          "role" in matchedItem && matchedItem.role === "agent" && "id" in matchedItem && typeof matchedItem.id === "string";
+        const pendingMatch = !!matched && !!lease.lastTurnId && pendingTurnsRef.current.has(lease.lastTurnId);
+        if (pendingTurnsRef.current.size - (pendingMatch ? 1 : 0) > 0 || (lease.lastTurnId && !matched) ||
+            (unconfirmedTurnRef.current && (!matched || lease.lastTurnId !== unconfirmedTurnRef.current))) {
+          if (!unconfirmedTurnRef.current) unconfirmedTurnRef.current = pendingTurnsRef.current.values().next().value ?? lease.lastTurnId;
+          setSessionNotice(sessionMismatchRef.current ? SESSION_MISMATCH_NOTICE : HISTORY_UNCONFIRMED_NOTICE);
+          lease.historyReady = true;
+          setHistoryState("ready");
+          return;
+        }
+        const restored: Message[] = body.messages.map((item: unknown, index: number) => {
+          if (!item || typeof item !== "object" || !("role" in item) || !("text" in item) ||
+              (item.role !== "user" && item.role !== "agent") || typeof item.text !== "string") throw new Error("invalid history message");
+          const sourceId = "id" in item && typeof item.id === "string" ? item.id : undefined;
+          const turnId = matched && index === matchedIndex ? lease.lastTurnId ?? undefined : sourceId ? historyTurnIdsRef.current.get(sourceId) : undefined;
+          return { id: idRef.current++, sourceId, turnId, role: item.role, text: item.text,
+            activities: parseActivities("activities" in item ? item.activities : undefined), truncated: "truncated" in item && item.truncated === true };
+        });
+        const detailBytes = restored.reduce((total, message) => total + (message.activities ?? []).reduce(
+          (sum, activity) => sum + (activity.detail ? new TextEncoder().encode(activity.detail.value).length : 0), 0), 0);
+        if (detailBytes > MAX_HISTORY_DETAIL_BYTES) throw new Error("history details too large");
+        if (matched && matchedItem && typeof matchedItem === "object" && "id" in matchedItem && typeof matchedItem.id === "string" && lease.lastTurnId) {
+          pendingTurnsRef.current.delete(lease.lastTurnId);
+          historyTurnIdsRef.current.set(matchedItem.id, lease.lastTurnId);
+          if (unconfirmedTurnRef.current === lease.lastTurnId) unconfirmedTurnRef.current = null;
+        }
+        const latest = [...restored].reverse().find((message) => message.role === "agent");
+        const latestKey = latest ? activityKey(latest) : null;
+        if (latestKey !== latestActivityKeyRef.current) setActivityOpen({});
+        latestActivityKeyRef.current = latestKey;
+        setHistoryActivityTruncated("activityTruncated" in body && body.activityTruncated === true);
+        setMessages(restored.length ? restored : [welcome]);
+        sessionMismatchRef.current = false;
+        setSessionMismatch(false);
+        setSessionNotice((notice) => notice === HISTORY_UNCONFIRMED_NOTICE || notice === SESSION_MISMATCH_NOTICE ? "" : notice);
+        lease.lastTurnId = null;
+        retainedTurnRef.current = null;
         lease.historyReady = true;
         setHistoryState("ready");
       } catch {
@@ -263,17 +382,40 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           if (event.type === "turn_snapshot") {
             if (event.sequence < lease.sequence || typeof event.revision !== "string") return;
             if (lease.revision !== null && lease.revision !== event.revision) {
-              restoreDraft(lease);
-              lease.draft = null;
-              lease.streamingId = null;
-              lease.turnId = null;
-              lease.cancelPending = false;
+              const initiatedHere = lease.sessionActionRevision === lease.revision;
+              lease.sessionActionRevision = null;
               lease.historyReady = false;
-              setMessages([welcome]);
-              setBusy(false);
-              setStopping(false);
               setCanRestore(false);
               setHistoryState("loading");
+              if (event.revisionReason === "transport" && lease.turnId) restoreDraft(lease);
+              if (event.revisionReason !== "transport") {
+                restoreDraft(lease);
+                lease.draft = null;
+                lease.streamingId = null;
+                lease.turnId = null;
+                lease.cancelPending = false;
+                setBusy(false);
+                setStopping(false);
+                if (retainedTurnRef.current && !initiatedHere) {
+                  unconfirmedTurnRef.current ??= retainedTurnRef.current;
+                  sessionMismatchRef.current = true;
+                  setSessionMismatch(true);
+                  setSessionNotice(SESSION_MISMATCH_NOTICE);
+                } else {
+                  sessionMismatchRef.current = false;
+                  setSessionMismatch(false);
+                  stickToBottomRef.current = true;
+                  lease.lastTurnId = null;
+                  retainedTurnRef.current = null;
+                  pendingTurnsRef.current.clear();
+                  unconfirmedTurnRef.current = null;
+                  historyTurnIdsRef.current.clear();
+                  latestActivityKeyRef.current = null;
+                  setActivityOpen({});
+                  setHistoryActivityTruncated(false);
+                  setMessages([welcome]);
+                }
+              }
             }
             lease.revision = event.revision;
             lease.sequence = event.sequence;
@@ -283,6 +425,10 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
             lease.readyTimer = undefined;
             setConn("open");
             const turn = event.turn;
+            let snapshotActivities: Activity[] | undefined;
+            if (turn && Array.isArray(turn.activities)) {
+              try { snapshotActivities = parseActivities(turn.activities); } catch { /* Ignore malformed activity data. */ }
+            }
             const ownTurn = !!turn && turn.id === lease.turnId && !isFinished(turn.phase);
             const otherPageBusy = event.busy && !ownTurn;
             setOtherBusy(otherPageBusy);
@@ -292,13 +438,27 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
               lease.historyReady = false;
               setHistoryState("loading");
             }
-            if (!event.busy && !lease.historyReady) void loadHistory(lease);
+            const ownedSnapshot = !!turn && (turn.id === lease.turnId || turn.id === lease.lastTurnId) &&
+              typeof turn.text === "string" && snapshotActivities !== undefined;
+            if (!event.busy && !lease.historyReady) {
+              if (ownedSnapshot && event.otherTurnLatest !== true) {
+                lease.historyReady = true;
+                setHistoryState("ready");
+              } else void loadHistory(lease);
+            }
             const id = lease.streamingId;
-            if (!turn || turn.id !== lease.turnId || id === null || typeof turn.text !== "string" || !Array.isArray(turn.activities)) return;
+            if (ownedSnapshot && turn && turn.id === lease.lastTurnId && turn.id !== lease.turnId && isFinished(turn.phase)) {
+              setMessages((prev) => prev.map((message) => message.turnId === turn.id && message.role === "agent"
+                ? { ...message, text: turn.text, activities: snapshotActivities!, phase: turn.phase, streaming: false, truncated: turn.truncated }
+                : message));
+            }
+            const activities = snapshotActivities;
+            if (!turn || turn.id !== lease.turnId || id === null || typeof turn.text !== "string" || !activities) return;
             setPhase(turn.phase);
             setStopping(turn.phase === "stopping");
             setMessages((prev) => prev.map((m) => m.id === id ? {
-              ...m, text: turn.text, activities: turn.activities, phase: turn.phase,
+              ...m, text: turn.text, activities, phase: turn.phase,
+              notice: (turn.text.length > 0 || activities.length > 0) && m.notice === SEND_UNCERTAIN_NOTICE ? undefined : m.notice,
               streaming: !isFinished(turn.phase), truncated: turn.truncated,
             } : m));
             if (isFinished(turn.phase)) {
@@ -319,13 +479,19 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           const update = event.event;
           if (!update || typeof update !== "object") return;
           if (update.kind === "text") {
-            setMessages((prev) => prev.map((m) => m.id === id ? { ...m, text: m.text + update.delta } : m));
+            setMessages((prev) => prev.map((m) => m.id === id ? { ...m, text: m.text + update.delta, notice: m.notice === SEND_UNCERTAIN_NOTICE ? undefined : m.notice } : m));
           } else if (update.kind === "activity") {
+            let item: Activity;
+            try { item = parseActivities([update.activity])![0]; } catch { return; }
             setMessages((prev) => prev.map((m) => {
               if (m.id !== id) return m;
               const activities = m.activities ?? [];
-              const index = activities.findIndex((activity) => activity.id === update.activity.id);
-              return { ...m, activities: index < 0 ? [...activities, update.activity] : activities.map((activity, i) => i === index ? update.activity : activity) };
+              const index = activities.findIndex((activity) => activity.id === item.id);
+              if (index < 0 && activities.length >= 100) return { ...m, truncated: true };
+              const next = index < 0 ? [...activities, item] : activities.map((activity, i) => i === index ? item : activity);
+              try {
+                return { ...m, notice: m.notice === SEND_UNCERTAIN_NOTICE ? undefined : m.notice, activities: parseActivities(next) };
+              } catch { return { ...m, truncated: true }; }
             }));
           } else if (update.kind === "phase") {
             setPhase(update.phase);
@@ -373,8 +539,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
     function activate() {
       activation = {
         clientId: crypto.randomUUID(), issuedAt: Date.now(), workspaceId: wid,
-        released: false, ready: false, streamingId: null, turnId: null,
-        sequence: -1, revision: null, sessionActionPending: false, cancelPending: false, historyReady: false, historyLoading: false, historySupported: null, serverBusy: false,
+        released: false, ready: false, streamingId: null, turnId: null, lastTurnId: retainedTurnRef.current,
+        sequence: -1, revision: null, sessionActionPending: false, sessionActionRevision: null, cancelPending: false, historyReady: false, historyLoading: false, historySupported: null, serverBusy: false,
         draft: null, controller: new AbortController(), sse: null,
       };
       activeRef.current = activation;
@@ -384,7 +550,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       setSessionSwitching(false);
       setSessionActionPending(false);
       setSessionUncertain(false);
-      setSessionNotice("");
+      setSessionMismatch(sessionMismatchRef.current);
+      setSessionNotice(sessionMismatchRef.current ? SESSION_MISMATCH_NOTICE : "");
       setBusy(false);
       setOtherBusy(false);
       setStopping(false);
@@ -450,7 +617,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
     const text = input.trim();
     if (!text || busy || otherBusy) return;
     const lease = activeRef.current;
-    if (!lease || lease.released || !lease.ready || !lease.historyReady || !lease.revision || lease.serverBusy || lease.sessionActionPending || lease.turnId !== null || lease.workspaceId !== workspaceId) return;
+    if (!lease || lease.released || !lease.ready || !lease.historyReady || !lease.revision || lease.serverBusy || lease.sessionActionPending || sessionMismatchRef.current || lease.turnId !== null || lease.workspaceId !== workspaceId) return;
     if (attachments.some((a) => a.status === "uploading")) return;
 
     const ready = attachments.filter((a) => a.status === "ready");
@@ -461,12 +628,18 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       ? `${text}\n\n附件已保存到工作区，请读取使用：\n${ready.map((a) => `- ${a.path}（${a.name}）`).join("\n")}`
       : text;
 
-    const userMsg: Message = { id: idRef.current++, role: "user", text: body };
-    const agentMsg: Message = { id: idRef.current++, role: "agent", text: "", streaming: true, phase: "running", activities: [] };
     const turnId = crypto.randomUUID();
+    const userMsg: Message = { id: idRef.current++, turnId, role: "user", text: body };
+    const agentMsg: Message = { id: idRef.current++, turnId, role: "agent", text: "", streaming: true, phase: "running", activities: [] };
     lease.streamingId = agentMsg.id;
     lease.turnId = turnId;
+    lease.lastTurnId = turnId;
+    retainedTurnRef.current = turnId;
+    pendingTurnsRef.current.add(turnId);
+    latestActivityKeyRef.current = activityKey(agentMsg);
+    setActivityOpen({});
     lease.draft = { text, attachments: ready };
+    stickToBottomRef.current = true;
     setMessages((prev) => [...prev, userMsg, agentMsg]);
     setInput("");
     setAttachments([]);
@@ -483,7 +656,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       if (!res.ok && res.status >= 500 && !lease.released && activeRef.current === lease && lease.turnId === turnId) {
         restoreDraft(lease);
         setMessages((prev) => prev.map((m) => m.id === agentMsg.id
-          ? { ...m, notice: "发送状态暂时未知，可尝试停止并等待连接恢复。" }
+          ? { ...m, notice: SEND_UNCERTAIN_NOTICE }
           : m));
       } else if (!res.ok && !lease.released && activeRef.current === lease && lease.turnId === turnId) {
         setMessages((prev) => prev.map((m) => m.id === agentMsg.id
@@ -501,7 +674,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       if (lease.released || activeRef.current !== lease || lease.turnId !== turnId) return;
       restoreDraft(lease);
       setMessages((prev) => prev.map((m) => m.id === agentMsg.id
-        ? { ...m, notice: "发送状态暂时未知，可尝试停止并等待连接恢复。" }
+        ? { ...m, notice: SEND_UNCERTAIN_NOTICE }
         : m));
     }
   }
@@ -509,11 +682,13 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
   async function changeSession(action: "new" | "restore") {
     const lease = activeRef.current;
     if (!lease || lease.released || !lease.ready || !lease.historyReady || !lease.revision ||
-        lease.serverBusy || lease.sessionActionPending || lease.turnId !== null || !sessionSupported || sessionUncertain ||
+        lease.serverBusy || lease.sessionActionPending || sessionMismatchRef.current || lease.turnId !== null || !sessionSupported || sessionUncertain ||
         (action === "restore" && !canRestore)) return;
+    if (unconfirmedTurnRef.current && !window.confirm("当前回复尚未与历史记录核对，切换会清除页面中的这条回复。是否继续？")) return;
     const confirmMigration = action === "restore" && restoreNeedsMigration;
     if (confirmMigration && !window.confirm("此会话使用旧格式，Pi 恢复时可能改写原文件。请先备份，确认继续？")) return;
     lease.sessionActionPending = true;
+    lease.sessionActionRevision = lease.revision;
     setSessionActionPending(true);
     setSessionNotice("");
     try {
@@ -527,14 +702,19 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       const body = await res.json().catch(() => ({}));
       if (lease.released || activeRef.current !== lease) return;
       if (!res.ok) {
+        lease.sessionActionRevision = null;
         const code = body?.error?.code;
         if (code === "SESSION_NOT_SAVED") setSessionNotice("当前会话有未保存的消息，暂时无法切换。");
         else if (code === "SESSION_EXPIRED") { setCanRestore(false); setSessionNotice("没有可恢复的 24 小时内会话。"); }
         else if (code === "SESSION_CHANGED" || code === "AGENT_BUSY") setSessionNotice("会话状态已变化，请稍后重试。");
         else setSessionNotice("无法切换会话，请稍后重试。");
         if (res.status >= 500) { lease.historyReady = false; setSessionUncertain(true); }
-      } else if (body.cancelled === true) setSessionNotice("会话切换已取消。");
+      } else if (body.cancelled === true) {
+        lease.sessionActionRevision = null;
+        setSessionNotice("会话切换已取消。");
+      }
     } catch {
+      lease.sessionActionRevision = null;
       if (!lease.released && activeRef.current === lease) {
         lease.historyReady = false;
         setSessionUncertain(true);
@@ -568,58 +748,68 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       lease.cancelPending = false;
       setStopping(false);
       setPhase(previousPhase);
-      setMessages((prev) => prev.map((m) => m.id === id ? { ...m, phase: previousPhase, notice: "停止请求未确认，请重试。" } : m));
+      setMessages((prev) => prev.map((m) => m.id === id ? { ...m, phase: previousPhase, notice: STOP_UNCERTAIN_NOTICE } : m));
     }
   }
 
-  const workingLabel = phase === "uncertain" ? "任务状态未确认" : stopping ? "正在停止" : phase === "retrying" ? "正在重试" : phase === "compacting" ? "正在整理上下文" : "正在处理";
+  const turnUnconfirmed = messages.some((message) => message.streaming && (message.notice === SEND_UNCERTAIN_NOTICE || message.notice === STOP_UNCERTAIN_NOTICE));
+  const workingLabel = phase === "uncertain" ? "任务状态未确认" : stopping ? "正在停止" : turnUnconfirmed ? "任务状态未确认" : phase === "retrying" ? "正在重试" : phase === "compacting" ? "正在整理上下文" : "正在处理";
   const statusLabel =
-    conn === "open" ? (sessionUncertain ? "会话状态未确认" : sessionSwitching || sessionActionPending ? "正在切换会话" : busy ? workingLabel : otherBusy ? "其他页面正在处理" : historyState === "error" ? "会话恢复失败" : historyState === "loading" ? "正在恢复会话" : "等待输入") :
+    conn === "open" ? (sessionMismatch ? "会话已切换" : sessionUncertain ? "会话状态未确认" : sessionSwitching || sessionActionPending ? "正在切换会话" : busy ? workingLabel : otherBusy ? "其他页面正在处理" : historyState === "error" ? "会话恢复失败" : historyState === "loading" ? "正在恢复会话" : "等待输入") :
     conn === "connecting" ? "正在连接" :
     conn === "error" ? "连接失败" : "已断开连接";
   const dotColor =
     conn === "open" ? (busy ? "bg-amber-500 animate-pulse motion-reduce:animate-none" : "bg-[#799b39]") :
     conn === "connecting" ? "bg-amber-500 animate-pulse motion-reduce:animate-none" : "bg-neutral-400";
+  let latestAssistantId: number | null = null;
+  for (const message of messages) if (message.role === "agent" && message.id !== welcome.id) latestAssistantId = message.id;
 
   return (
     <div className="flex h-full flex-col bg-[#fffefa]">
       {/* Panel header */}
       <div className="flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-[var(--brand-line)] bg-[var(--brand-paper)] px-4">
-        <span className="flex items-center gap-2 text-sm font-bold text-[var(--brand-ink)]">
+        <span className="flex shrink-0 items-center gap-2 whitespace-nowrap text-sm font-bold text-[var(--brand-ink)]">
           <span className="grid h-7 w-7 place-items-center rounded-md bg-[var(--brand-lime)] text-base" aria-hidden="true">✳</span>AI 编程助手
         </span>
-        <div className="flex items-center gap-1.5">
-          <span role="status" aria-live="polite" className="flex items-center gap-1.5 rounded-full border border-[#dce3d3] bg-white px-2.5 py-1 text-xs text-[var(--brand-muted)]">
-            <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
-            {statusLabel}
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span role="status" aria-live="polite" title={statusLabel} className="flex min-w-0 items-center gap-1.5 rounded-full border border-[#dce3d3] bg-white px-2.5 py-1 text-xs text-[var(--brand-muted)]">
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColor}`} />
+            <span className="truncate">{statusLabel}</span>
           </span>
-          <span title="新建会话（空会话未保存，重新打开可能恢复上次会话）">
-            <button type="button" aria-label="新建会话" title="新建会话（空会话未保存，重新打开可能恢复上次会话）" onClick={() => void changeSession("new")}
-              disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || sessionSwitching || sessionActionPending || sessionUncertain || busy || otherBusy}
-              className="grid h-8 w-8 place-items-center rounded text-neutral-500 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40">
+          <IconTooltip label="新建会话">
+            <button type="button" aria-label="新建会话" onClick={() => void changeSession("new")}
+              disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || sessionSwitching || sessionActionPending || sessionUncertain || sessionMismatch || busy || otherBusy}
+              className="flex h-10 w-10 items-center justify-center rounded-md text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:pointer-events-none disabled:opacity-40">
               <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
             </button>
-          </span>
-          <span title="恢复上次会话（仅限 24 小时内）">
-            <button type="button" aria-label="恢复上次会话" title="恢复上次会话（仅限 24 小时内）" onClick={() => void changeSession("restore")}
-              disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || !canRestore || sessionSwitching || sessionActionPending || sessionUncertain || busy || otherBusy}
-              className="grid h-8 w-8 place-items-center rounded text-neutral-500 hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40">
+          </IconTooltip>
+          <IconTooltip label="恢复上次会话：仅限 24 小时内；更长内容依赖内置记忆。">
+            <button type="button" aria-label="恢复上次会话" onClick={() => void changeSession("restore")}
+              disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || !canRestore || sessionSwitching || sessionActionPending || sessionUncertain || sessionMismatch || busy || otherBusy}
+              className="flex h-10 w-10 items-center justify-center rounded-md text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:pointer-events-none disabled:opacity-40">
               <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l3 2" /></svg>
             </button>
-          </span>
+          </IconTooltip>
         </div>
       </div>
 
       {/* Messages */}
       <div
         ref={scrollRef}
+        onScroll={(event) => {
+          const el = event.currentTarget;
+          stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+        }}
         className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-5"
       >
         {sessionUncertain && <p role="alert" className="text-sm text-red-600">会话状态未确认，请关闭所有工作区页面后重新打开。</p>}
         {sessionNotice && <p role="alert" className="text-sm text-red-600">{sessionNotice}</p>}
         {historyState === "error" && <p role="alert" className="text-sm text-red-600">无法恢复最近会话，请刷新页面重试。</p>}
-        {messages.map((m) => (
-          <div
+        {historyActivityTruncated && <p className="text-xs text-[var(--brand-muted)]">部分操作详情已省略。</p>}
+        {messages.map((m) => {
+          const key = activityKey(m);
+          const expanded = activityOpen[key] ?? (m.id === latestAssistantId);
+          return <div
             key={m.id}
             className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
           >
@@ -635,19 +825,33 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
                 <span aria-hidden="true" className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-neutral-400 align-text-bottom motion-reduce:animate-none" />
               )}
               {m.streaming && !m.text && (
-                <div className="flex items-center gap-2 text-[var(--brand-muted)]">
-                  <span aria-hidden="true" className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-[#c4cbb9] border-t-[var(--brand-purple)] motion-reduce:animate-none" />
-                  {m.phase === "stopping" ? "正在停止…" : m.phase === "retrying" ? "正在重试…" : m.phase === "compacting" ? "正在整理上下文…" : "正在处理…"}
+                <div className="text-[var(--brand-muted)]">
+                  {m.phase === "stopping" ? "正在停止…" : m.phase === "uncertain" || m.notice === SEND_UNCERTAIN_NOTICE || m.notice === STOP_UNCERTAIN_NOTICE ? "任务状态未确认" : m.phase === "retrying" ? "正在重试…" : m.phase === "compacting" ? "正在整理上下文…" : "正在处理…"}
                 </div>
               )}
               {!!m.activities?.length && (
-                <div className="mt-2 space-y-1 border-t border-[#e1e6d8] pt-2 text-xs text-[#66715c]" aria-label="处理进度">
-                  {m.activities.map((activity) => (
-                    <div key={activity.id} className="flex items-center gap-1.5">
-                      <span aria-hidden="true">{activity.status === "running" ? "◌" : activity.status === "failed" ? "!" : "✓"}</span>
-                      <span>{activityLabel(activity.name)} · {activity.status === "running" ? "进行中" : activity.status === "failed" ? "失败" : "已完成"}</span>
-                    </div>
-                  ))}
+                <div className="mt-2 border-t border-[#e1e6d8] pt-2 text-xs text-[#66715c]">
+                  <button type="button" aria-expanded={expanded} aria-controls={`activity-${m.id}`}
+                    onClick={() => setActivityOpen((previous) => ({ ...previous, [key]: !expanded }))}
+                    className="flex items-center gap-1 rounded text-left font-medium hover:text-[var(--brand-ink)]">
+                    <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>操作详情（{m.activities.length}）
+                  </button>
+                  <section id={`activity-${m.id}`} hidden={!expanded} className="mt-1 space-y-1" aria-label="操作详情">
+                    {m.activities.map((activity) => {
+                      const status = activity.status === "running" && m.phase === "uncertain" ? "unknown" : activity.status;
+                      const metrics = activityMetricsLabel(activity.metrics);
+                      return <div key={activity.id} className="flex items-start gap-1.5">
+                        <span aria-hidden="true">{status === "running" ? "◌" : status === "failed" ? "!" : status === "unknown" ? "?" : "✓"}</span>
+                        <div className="min-w-0 flex-1">
+                          <div className="break-all">{activityLabel(activity.name)}{activity.detail?.kind === "path" ? ` · ${activity.detail.value}` : ""} · {status === "running" ? "进行中" : status === "failed" ? "失败" : status === "unknown" ? "状态未确认" : "已完成"}</div>
+                          {metrics && <div className="mt-0.5 text-[var(--brand-muted)]">{metrics}</div>}
+                          {activity.detail?.kind === "command" && <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-white px-2 py-1 font-mono text-[var(--brand-ink)]">{activity.detail.value}</pre>}
+                          {(activity.detailTruncated || activity.detail?.truncated) && <div className="mt-0.5">详情过长，部分已省略。</div>}
+                          {activity.detail?.escaped && <div className="mt-0.5">不可见控制字符已转义。</div>}
+                        </div>
+                      </div>;
+                    })}
+                  </section>
                 </div>
               )}
               {m.phase === "uncertain" && <p className="mt-2 text-xs text-red-600">暂时无法确认任务状态。请关闭所有工作区页面后重新打开。</p>}
@@ -656,8 +860,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
               {m.truncated && <p className="mt-2 text-xs text-neutral-500">内容较长，部分内容已省略。</p>}
               {m.notice && <p className="mt-2 text-xs text-red-600">{m.notice}</p>}
             </div>
-          </div>
-        ))}
+          </div>;
+        })}
       </div>
 
       {/* Input */}
@@ -668,6 +872,18 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           void send();
         }}
       >
+        {busy && conn === "open" && phase !== "uncertain" && !sessionUncertain && !turnUnconfirmed && (
+          <div data-assistant-waiting="" aria-hidden="true" className="mb-2 flex items-center gap-2 text-xs text-[var(--brand-muted)]">
+            <svg viewBox="0 0 48 48" className="h-8 w-8 motion-safe:animate-bounce motion-reduce:animate-none" aria-hidden="true">
+              <path d="M24 5v6" stroke="#42385f" strokeWidth="2.5" strokeLinecap="round" />
+              <circle cx="24" cy="5" r="3" fill="#b9db70" />
+              <rect x="6" y="11" width="36" height="30" rx="10" fill="#f0ebfe" stroke="#42385f" strokeWidth="2.5" />
+              <circle cx="17" cy="23" r="2.5" fill="#42385f" /><circle cx="31" cy="23" r="2.5" fill="#42385f" />
+              <path d="M19 31q5 5 10 0" fill="none" stroke="#42385f" strokeWidth="2.5" strokeLinecap="round" />
+            </svg>
+            <span>{workingLabel}…</span>
+          </div>
+        )}
         {attachments.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5">
             {attachments.map((a) => (
@@ -737,23 +953,32 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
             }}
             aria-label="发送给 AI 编程助手的消息"
             rows={2}
-            placeholder={conn === "open" ? "描述你想实现的应用或功能…" : conn === "error" ? "连接失败，请刷新页面重试。" : "正在连接编程助手…"}
-            disabled={conn !== "open"}
-            className="flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-neutral-800 outline-none placeholder:text-neutral-400 disabled:cursor-not-allowed disabled:text-neutral-400"
+            placeholder={conn !== "open" ? (conn === "error" ? "连接失败，请刷新页面重试。" : "正在连接编程助手…") : sessionMismatch ? "会话已切换，请刷新页面。" : busy ? "请等待助手回复…" : otherBusy ? "其他页面正在处理…" : "描述你想实现的应用或功能…"}
+            disabled={conn !== "open" || busy || otherBusy || sessionMismatch}
+            className="min-w-0 flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-neutral-800 outline-none placeholder:text-neutral-400 disabled:cursor-not-allowed disabled:text-neutral-400"
           />
-          {busy ? (
-            <button type="button" onClick={() => void stop()} disabled={stopping || phase === "uncertain"} className="brand-button min-h-9 px-3 py-1.5 text-sm">
-              {phase === "uncertain" ? "状态未确认" : stopping ? "正在停止…" : "停止"}
+          <IconTooltip placement="top" label={phase === "uncertain" && busy ? "状态未确认，无法停止" : stopping ? "正在停止" : "停止生成"}>
+            <button
+              type="button"
+              onClick={() => void stop()}
+              disabled={!busy || stopping || phase === "uncertain"}
+              aria-label="停止生成"
+              aria-busy={stopping}
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-red-600 hover:bg-red-50 disabled:pointer-events-none disabled:opacity-40"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" className="h-4 w-4" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" /></svg>
             </button>
-          ) : (
+          </IconTooltip>
+          <IconTooltip placement="top" label="发送消息">
             <button
               type="submit"
-              disabled={otherBusy || sessionSwitching || sessionActionPending || sessionUncertain || historyState !== "ready" || !input.trim() || conn !== "open" || attachments.some((a) => a.status !== "ready")}
-              className="brand-button min-h-9 px-3 py-1.5 text-sm"
+              aria-label="发送消息"
+              disabled={busy || otherBusy || sessionSwitching || sessionActionPending || sessionUncertain || sessionMismatch || historyState !== "ready" || !input.trim() || conn !== "open" || attachments.some((a) => a.status !== "ready")}
+              className="brand-button h-9 w-9 shrink-0 p-0 disabled:pointer-events-none"
             >
-              发送
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6" /></svg>
             </button>
-          )}
+          </IconTooltip>
         </div>
         <p className="mt-1.5 px-0.5 text-[13px] text-neutral-400">
           Enter 发送 · Shift+Enter 换行 · 附件保存到工作区 .attachments/{maxFileBytes !== null ? ` · 单个文件上限 ${formatBytes(maxFileBytes)}` : ""}

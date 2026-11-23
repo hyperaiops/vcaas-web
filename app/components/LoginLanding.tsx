@@ -41,8 +41,8 @@ export default function LoginLanding() {
           <div className={styles.heroCopy}>
             <div className={styles.eyebrow}><span /> Token 永久免费 · 和 AI 一起编程创作</div>
             <h1 id="landing-title" className={styles.title}>
-              今朝侬<br />
-              <span className={styles.vibe}>vibe<svg viewBox="0 0 300 18" preserveAspectRatio="none" aria-hidden="true"><path d="M3 13C68 1 186 2 295 8M24 16C113 7 224 7 280 12" /></svg></span> 了伐<span className={styles.question}>？</span>
+              今天你<br />
+              <span className={styles.vibe}>vibe<svg viewBox="0 0 300 18" preserveAspectRatio="none" aria-hidden="true"><path d="M3 13C68 1 186 2 295 8M24 16C113 7 224 7 280 12" /></svg></span> 了吗<span className={styles.question}>？</span>
             </h1>
             <p className={styles.subtitle}><strong>免费使用，</strong>随心创造。</p>
             <p className={styles.description}>平台 Token 永久免费，和 AI 聊天编程。<br className={styles.desktopBreak} />把你的想法和创意，变成真正能用的网页、工具和应用。</p>

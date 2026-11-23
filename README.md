@@ -229,6 +229,12 @@ filesystem isolation.
   endpoint，也没有 endpoint 模式或 TLS 转发配置。Bearer token 认证和项目归属检查
   保持不变，token 不交给浏览器。PiWorker 的持久会话恢复尚未实现。
 
+操作详情展示 Pi 请求的命令及参数、可验证的工作区内路径和部分数字信息；不单独展示
+命令输出、文件正文、搜索工具的搜索词或修改前后的内容。命令本身可能包含搜索词、
+凭据、私有路径或内嵌文件片段，展示时不会保证自动脱敏，请注意屏幕共享。本地会话
+历史对该工作区的授权页面共享；详细文本按字节限长，超出会提示，控制字符显示为
+转义形式。
+
 prod 连接链路为：浏览器 → webcontainer 后端 → PiWorker ClusterIP Service → agent。
 `kubectl port-forward svc/webcontainer 3000:3000` 只转发 Web UI；RPC 仍从集群内的
 webcontainer Pod 发出。

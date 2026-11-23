@@ -9,7 +9,8 @@ import WebSocket from "ws";
 import { ensurePiWorker, deletePiWorker } from "@/app/lib/bridge/k8s";
 import { LocalPiTransport } from "@/app/lib/bridge/local";
 import { runtimeMode, BridgeLifecycleError } from "@/app/lib/bridge/runtime";
-import { projectTranscript } from "@/app/lib/bridge/transcript";
+import { projectHistory, projectTranscript, transcriptLeaf } from "@/app/lib/bridge/transcript";
+import { activityDetail, activityInput, activityName, limitActivityDetails, type Activity, type ActivityInput } from "@/app/lib/bridge/activity";
 import type { LocalSession } from "@/app/lib/bridge/local-sessions";
 
 export { BridgeLifecycleError };
@@ -28,10 +29,13 @@ type Transport =
 
 type Lease = { issuedAt: number; released: boolean; expires: number; subscribers: Set<(frame: string) => void>; timer?: ReturnType<typeof setTimeout> };
 type TurnPhase = "running" | "retrying" | "compacting" | "stopping" | "uncertain" | "done" | "stopped" | "failed";
-type Activity = { id: string; name: string; status: "running" | "done" | "failed" };
 type Turn = {
   id: string; clientId: string; promptId: string; phase: TurnPhase; text: string; activities: Activity[];
-  truncated: boolean; sent: boolean; accepted: boolean; started: boolean; settled: boolean;
+  activityIds: Map<string, string>; detailPending: Set<string>; detailAttempts: Map<string, string>;
+  detailQueued: Map<string, { input: ActivityInput; signature: string; transport: Transport | null }>;
+  detailCandidates: Map<string, Pick<Activity, "detail" | "metrics">>;
+  sessionId?: string; anchor?: string | null; endAnchor?: string | null;
+  finalizing: boolean; endCaptured: boolean; activityOverflow: boolean; truncated: boolean; sent: boolean; accepted: boolean; started: boolean; settled: boolean;
   cancelRequested: boolean; aborted: boolean; failed: boolean; pendingAborts: Set<string>; epoch: number; abortEpoch: number;
   timer?: ReturnType<typeof setTimeout>;
 };
@@ -39,7 +43,7 @@ type PendingRpc = { command: string; resolve: (data: unknown) => void; reject: (
 type Generation = {
   controller: AbortController; connecting: Promise<AgentConnect> | null; transport: Transport | null;
   handle: AgentConnect | null; busy: boolean; turn: Turn | null; sequence: number;
-  revision: string; switching: boolean; switchUncertain: boolean; restoreCandidate: LocalSession | null;
+  revision: string; revisionReason: "initial" | "session" | "transport"; activeSessionId: string | null; switching: boolean; switchUncertain: boolean; restoreCandidate: LocalSession | null;
   cancelled: Map<string, number>; completed: Map<string, Turn>; recent: Map<string, number>;
   pendingRpc: Map<string, PendingRpc>;
 };
@@ -158,7 +162,7 @@ export async function ensureAgentSession(id: string, input: AgentLease): Promise
   }
   live(w, input.clientId);
   if (w.dirty) { release(w, l); error(503, "CLEANUP_PENDING", "Agent cleanup must succeed before starting"); }
-  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, transport: null, handle: null, busy: false, turn: null, sequence: 0, revision: randomUUID(), switching: false, switchUncertain: false, restoreCandidate: null, cancelled: new Map(), completed: new Map(), recent: new Map(), pendingRpc: new Map() };
+  if (!w.generation) w.generation = { controller: new AbortController(), connecting: null, transport: null, handle: null, busy: false, turn: null, sequence: 0, revision: randomUUID(), revisionReason: "initial", activeSessionId: null, switching: false, switchUncertain: false, restoreCandidate: null, cancelled: new Map(), completed: new Map(), recent: new Map(), pendingRpc: new Map() };
   try {
     const handle = await connect(id, w, w.generation);
     live(w, input.clientId);
@@ -195,7 +199,8 @@ function snapshot(g: Generation, clientId: string): string {
   const t = g.turn?.clientId === clientId ? g.turn : g.completed.get(clientId);
   return JSON.stringify({
     type: "turn_snapshot", version: 1, sequence: g.sequence, busy: g.busy,
-    revision: g.revision, switching: g.switching, uncertain: g.switchUncertain,
+    revision: g.revision, revisionReason: g.revisionReason, switching: g.switching, uncertain: g.switchUncertain,
+    otherTurnLatest: !!g.turn && g.turn.clientId !== clientId,
     ...(t ? { turn: { id: t.id, text: t.text, phase: t.phase, activities: t.activities, truncated: t.truncated } } : {}),
   });
 }
@@ -240,8 +245,24 @@ function rememberTurn(g: Generation, t: Turn) {
 }
 function finishTurn(w: Workspace, g: Generation, t: Turn) {
   if (g.turn !== t || !g.busy || !t.settled || t.pendingAborts.size) return;
+  if (runtimeMode() === "local" && t.sent && t.anchor !== undefined && t.sessionId === g.activeSessionId && !t.endCaptured) {
+    if (!t.finalizing) {
+      t.finalizing = true;
+      void Promise.resolve().then(() => requestLocalRpc(g, "get_entries", undefined, "end"))
+        .then((entries) => { if (current(w, g) && g.turn === t) t.endAnchor = transcriptLeaf(entries); })
+        .catch(() => {})
+        .finally(() => {
+          if (!current(w, g) || g.turn !== t) return;
+          t.finalizing = false;
+          t.endCaptured = true;
+          finishTurn(w, g, t);
+        });
+    }
+    return;
+  }
   clearTurnTimer(t);
   t.phase = t.aborted ? "stopped" : t.failed ? "failed" : "done";
+  t.activities = t.activities.map((activity) => activity.status === "running" ? { ...activity, status: "unknown" as const } : activity);
   g.busy = false;
   rememberTurn(g, t);
   publishSnapshot(w, g);
@@ -274,7 +295,8 @@ function requestAbort(w: Workspace, g: Generation, t: Turn) {
 function newTurn(clientId: string, turnId: string): Turn {
   return {
     id: turnId, clientId, promptId: `req-${randomUUID()}`, phase: "running", text: "", activities: [],
-    truncated: false, sent: false, accepted: false, started: false, settled: false,
+    activityIds: new Map(), detailPending: new Set(), detailAttempts: new Map(), detailQueued: new Map(), detailCandidates: new Map(),
+    finalizing: false, endCaptured: false, activityOverflow: false, truncated: false, sent: false, accepted: false, started: false, settled: false,
     cancelRequested: false, aborted: false, failed: false, pendingAborts: new Set(), epoch: 0, abortEpoch: 0,
   };
 }
@@ -313,6 +335,20 @@ export async function sendPrompt(id: string, clientId: string, message: string, 
       t.aborted = true; t.settled = true;
       finishTurn(w, g, t);
       return;
+    }
+    if (runtimeMode() === "local") {
+      if (!g.activeSessionId) error(503, "AGENT_CLOSED", "Agent session is unavailable");
+      t.sessionId = g.activeSessionId;
+      const entries = await requestLocalRpc(g, "get_entries", undefined, "anchor");
+      live(w, clientId); check(w, g);
+      if (revision !== g.revision) error(409, "SESSION_CHANGED", "Agent session changed");
+      if (g.turn !== t || !g.busy) return;
+      if (t.cancelRequested) {
+        t.aborted = true; t.settled = true;
+        finishTurn(w, g, t);
+        return;
+      }
+      t.anchor = transcriptLeaf(entries);
     }
     t.sent = true;
     sendFrame(w, g, t, { id: t.promptId, type: "prompt", message });
@@ -364,11 +400,11 @@ function rejectPendingRpc(g: Generation) {
   g.pendingRpc.clear();
 }
 
-function requestLocalRpc(g: Generation, command: "get_state" | "get_entries" | "new_session" | "switch_session", sessionPath?: string): Promise<unknown> {
+function requestLocalRpc(g: Generation, command: "get_state" | "get_entries" | "new_session" | "switch_session", sessionPath?: string, prefix = "rpc"): Promise<unknown> {
   const transport = g.transport;
   if (!transport || transport.kind !== "local") error(503, "AGENT_CLOSED", "Local agent is not connected.");
   if (g.pendingRpc.size >= 32) error(503, "AGENT_CAPACITY", "Too many session requests.");
-  const id = `rpc-${randomUUID()}`;
+  const id = `${prefix}-${randomUUID()}`;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       g.pendingRpc.delete(id);
@@ -400,12 +436,30 @@ export async function getCurrentTranscript(id: string, clientId: string) {
   const data = await requestLocalRpc(g, "get_entries");
   const candidate = g.restoreCandidate;
   const canRestore = candidate ? await transport.pi.canRestore(candidate) : false;
+  const completed = g.completed.get(clientId);
+  const statuses = new Map([...(completed?.activityIds ?? [])].map(([sourceId, id]) =>
+    [sourceId, completed?.activities.find((activity) => activity.id === id)?.status ?? "unknown"] as const));
+  const details = new Map<string, NonNullable<Activity["detail"]>>();
+  const metrics = new Map<string, NonNullable<Activity["metrics"]>>();
+  const omitted = new Set<string>();
+  for (const [sourceId, id] of completed?.activityIds ?? []) {
+    const activity = completed?.activities.find((item) => item.id === id);
+    if (activity?.detail) details.set(sourceId, activity.detail);
+    if (activity?.metrics) metrics.set(sourceId, activity.metrics);
+    if (activity?.detailTruncated) omitted.add(sourceId);
+  }
+  const canReconcile = completed !== undefined && completed.endCaptured && completed.endAnchor !== undefined &&
+    completed.sessionId === g.activeSessionId && completed.detailPending.size === 0 && completed.detailQueued.size === 0;
+  const sourceIds = canReconcile ? new Set(statuses.keys()) : new Set<string>();
+  const history = await projectHistory(data, transport.pi.cwd, sourceIds, canReconcile ? completed?.anchor : undefined,
+    canReconcile && completed ? { statuses, details, metrics, omitted, text: completed.text } : undefined, canReconcile ? completed?.endAnchor : undefined);
   live(w, clientId);
   check(w, g);
   if (g.transport !== transport) error(503, "AGENT_CLOSED", "Agent connection changed while loading");
   if (g.busy || g.sequence !== sequence) error(409, "AGENT_BUSY", "Agent session changed while loading");
   return { apiVersion: "v1", supported: true as const, sequence, revision: g.revision, canRestore,
-    restoreNeedsMigration: canRestore && candidate?.version !== 3, messages: projectTranscript(data) };
+    restoreNeedsMigration: canRestore && candidate?.version !== 3, messages: history.messages,
+    activityTruncated: history.activityTruncated, ...(history.matched && completed ? { reconciledTurnId: completed.id, reconciledIndex: history.matchedIndex } : {}) };
 }
 
 export async function changeAgentSession(id: string, clientId: string, revision: string, action: "new" | "restore", confirmMigration = false) {
@@ -422,6 +476,7 @@ export async function changeAgentSession(id: string, clientId: string, revision:
   g.busy = true;
   g.switching = true;
   g.revision = randomUUID();
+  g.revisionReason = "session";
   publishSnapshot(w, g);
   let sent = false;
   try {
@@ -447,6 +502,10 @@ export async function changeAgentSession(id: string, clientId: string, revision:
     check(w, g); live(w, clientId);
     if (typeof result?.cancelled !== "boolean") throw new Error("Invalid session response");
     if (!result.cancelled) {
+      const nextState = await requestLocalRpc(g, "get_state") as { sessionId?: unknown };
+      check(w, g); live(w, clientId);
+      if (typeof nextState?.sessionId !== "string" || !nextState.sessionId || nextState.sessionId.length > 200) throw new Error("Invalid session state");
+      g.activeSessionId = nextState.sessionId;
       g.restoreCandidate = action === "new" && candidate ? await transport.pi.refreshSession(candidate) : null;
       check(w, g); live(w, clientId);
       g.turn = null;
@@ -519,6 +578,42 @@ function connect(id: string, w: Workspace, g: Generation): Promise<AgentConnect>
   g.connecting = task;
   void task.then(() => { if (g.connecting === task) g.connecting = null; }, () => { if (g.connecting === task) g.connecting = null; });
   return task;
+}
+
+function updateActivityDetail(w: Workspace, g: Generation, t: Turn, sourceId: string, activity: Activity, args: unknown) {
+  if (activity.name === "other") return;
+  const input = activityInput(activity.name, args);
+  if (!input) return;
+  const signature = JSON.stringify(input);
+  if (t.detailAttempts.get(sourceId) === signature) return;
+  t.detailAttempts.set(sourceId, signature);
+  const request = { input, signature, transport: g.transport };
+  if (t.detailPending.has(sourceId)) { t.detailQueued.set(sourceId, request); return; }
+
+  const resolve = (item: typeof request) => {
+    const cwd = item.transport?.kind === "local" ? item.transport.pi.cwd : undefined;
+    t.detailPending.add(sourceId);
+    void activityDetail(activity.name, item.input, cwd).then((detail) => {
+      if (!current(w, g) || g.transport !== item.transport || g.switching || g.switchUncertain ||
+          t.detailAttempts.get(sourceId) !== item.signature || (g.turn !== t && g.completed.get(t.clientId) !== t)) return;
+      t.detailCandidates.set(activity.id, { ...(detail ? { detail } : {}), ...(item.input.metrics ? { metrics: item.input.metrics } : {}) });
+      const proposed = t.activities.map((value) => ({ id: value.id, name: value.name, status: value.status, ...t.detailCandidates.get(value.id) }));
+      const limited = limitActivityDetails(proposed);
+      const changed = limited.activities.filter((value, index) => JSON.stringify(value) !== JSON.stringify(t.activities[index]));
+      if (!changed.length) return;
+      t.activities = limited.activities;
+      if (g.turn === t && g.busy && !g.switching) {
+        if (changed.length === 1) publishTurn(w, g, t, { kind: "activity", activity: changed[0] });
+        else publishSnapshot(w, g);
+      } else if (g.completed.get(t.clientId) === t) publishSnapshot(w, g);
+    }).catch(() => {}).finally(() => {
+      t.detailPending.delete(sourceId);
+      const next = t.detailQueued.get(sourceId);
+      t.detailQueued.delete(sourceId);
+      if (next && current(w, g) && g.transport === next.transport && !g.switching && !g.switchUncertain) resolve(next);
+    });
+  };
+  resolve(request);
 }
 
 /** Normalize Pi events before exposing them to the owner of the active turn. */
@@ -611,19 +706,24 @@ function deliver(w: Workspace, g: Generation, frame: string): void {
   }
   if (event.type === "tool_execution_start" || event.type === "tool_execution_update" || event.type === "tool_execution_end") {
     const toolCallId = event.toolCallId;
-    if (typeof toolCallId !== "string" || toolCallId.length > 200) return;
-    const index = t.activities.findIndex((activity) => activity.id === toolCallId);
-    if (index < 0 && event.type !== "tool_execution_start") return;
-    if (index < 0 && t.activities.length >= 100) { t.truncated = true; return; }
-    const name = typeof event.toolName === "string" && ["read", "write", "edit", "bash", "grep", "find", "ls"].includes(event.toolName)
-      ? event.toolName : "other";
+    if (typeof toolCallId !== "string" || !toolCallId || toolCallId.length > 200) return;
+    let id = t.activityIds.get(toolCallId);
+    if (!id && event.type !== "tool_execution_start") return;
+    if (!id && t.activities.length >= 100) {
+      if (!t.activityOverflow) { t.activityOverflow = true; t.truncated = true; publishSnapshot(w, g); }
+      return;
+    }
+    if (!id) { id = `activity-${t.activities.length + 1}`; t.activityIds.set(toolCallId, id); }
+    const index = t.activities.findIndex((activity) => activity.id === id);
+    const previous = index < 0 ? undefined : t.activities[index];
+    if (previous && previous.status !== "running") return;
     const activity: Activity = {
-      id: toolCallId,
-      name: index < 0 ? name : t.activities[index].name,
-      status: event.type === "tool_execution_end" ? event.isError === true ? "failed" : "done" : "running",
+      ...(previous ?? { id, name: activityName(event.toolName) }),
+      status: event.type === "tool_execution_end" ? event.isError === true ? "failed" : event.isError === false ? "done" : "unknown" : "running",
     };
     if (index < 0) t.activities.push(activity); else t.activities[index] = activity;
-    publishTurn(w, g, t, { kind: "activity", activity });
+    if (!previous || previous.status !== activity.status) publishTurn(w, g, t, { kind: "activity", activity });
+    if (event.type !== "tool_execution_end") updateActivityDetail(w, g, t, toolCallId, activity, event.args);
   }
 }
 
@@ -632,12 +732,16 @@ async function openLocal(id: string, w: Workspace, g: Generation): Promise<Agent
   const transport: Transport = { kind: "local", pi };
   g.transport = transport;
   pi.onMessage(frame => { if (current(w, g) && g.transport === transport) deliver(w, g, frame); });
-  pi.onStderr(line => console.error(`[agent:${id}] ${line}`));
+  let reportedStderr = false;
+  pi.onStderr(() => {
+    if (!reportedStderr) { reportedStderr = true; console.error(`[agent:${id}] Local Pi reported a diagnostic; details are hidden.`); }
+  });
   pi.onClose(() => {
     if (!current(w, g) || g.transport !== transport) return;
     g.transport = null;
     rejectPendingRpc(g);
     g.revision = randomUUID();
+    g.revisionReason = "transport";
     if (g.switching) { g.switching = false; g.switchUncertain = true; g.busy = true; }
     else if (g.busy && g.turn) markUncertain(w, g, g.turn);
     else if (!g.busy) { g.busy = true; g.switching = true; }
@@ -647,19 +751,23 @@ async function openLocal(id: string, w: Workspace, g: Generation): Promise<Agent
     }
   });
   try {
-    const state = await requestLocalRpc(g, "get_state") as { sessionFile?: unknown; model?: unknown };
+    const state = await requestLocalRpc(g, "get_state") as { sessionFile?: unknown; sessionId?: unknown; model?: unknown };
     check(w, g);
     if (g.transport !== transport) throw new Error("Agent connection closed");
-    if (!state?.model || typeof state.model !== "object") throw new Error("Agent model unavailable");
+    if (!state?.model || typeof state.model !== "object" || typeof state.sessionId !== "string" || !state.sessionId || state.sessionId.length > 200) throw new Error("Agent state unavailable");
     const active = typeof state.sessionFile === "string" ? state.sessionFile : null;
-    g.restoreCandidate = await pi.recentSession(active);
+    const candidate = await pi.recentSession(active);
     check(w, g);
     if (g.transport !== transport) throw new Error("Agent connection closed");
+    const changed = g.activeSessionId !== null && g.activeSessionId !== state.sessionId;
+    g.activeSessionId = state.sessionId;
+    g.restoreCandidate = candidate;
+    if (changed) { g.revision = randomUUID(); g.revisionReason = "session"; }
     if (g.switching && !g.switchUncertain) {
       g.switching = false;
       g.busy = false;
       publishSnapshot(w, g);
-    }
+    } else if (changed) publishSnapshot(w, g);
   } catch {
     if (g.transport === transport) g.transport = null;
     await pi.terminate();
