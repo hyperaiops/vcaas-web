@@ -15,9 +15,9 @@ export async function POST(request: Request) {
   const config = authConfig();
   const jar = await cookies();
   const token = jar.get(SESSION_COOKIE)?.value;
-  const idToken = token ? revokeSession(token) : null;
+  const idToken = token ? await revokeSession(token) : null;
   const transaction = jar.get(TRANSACTION_COOKIE)?.value;
-  if (transaction) consumeLogin(transaction);
+  if (transaction) await consumeLogin(transaction);
   let target = new URL("/", config.origin);
   if (idToken) {
     try {

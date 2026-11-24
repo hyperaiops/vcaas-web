@@ -6,16 +6,15 @@
 // time by the tree builder — same model as the Go API, generalised to many
 // workspaces.
 //
-// This module imports `better-sqlite3`, a native Node addon, so it must only
-// ever be imported from Route Handlers (Node runtime). Importing it from a
-// Client Component would pull the native addon into the browser bundle.
+// This server-only module initializes the existing SQLite schema and uses
+// Prisma for application queries. Workspace files remain on disk.
 
 import "server-only";
 import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
-import Database from "better-sqlite3";
-import type { Database as DatabaseType } from "better-sqlite3";
+import { pathToFileURL } from "node:url";
+import { Prisma, PrismaClient } from "@prisma/client";
 import { isValidWorkspaceId, type WorkspaceRow } from "./workspace/types";
 
 export type NewWorkspace = {
@@ -25,140 +24,137 @@ export type NewWorkspace = {
   ownerId: string;
 };
 
-let dbInstance: DatabaseType | null = null;
+let prismaInstance: Promise<PrismaClient> | null = null;
 
 function dbPath(): string {
-  return process.env.WORKSPACE_DB_PATH ?? path.join(process.cwd(), ".data", "workspaces.db");
+  return path.resolve(/* turbopackIgnore: true */ process.env.WORKSPACE_DB_PATH ?? path.join(process.cwd(), ".data", "workspaces.db"));
 }
 
-export function getDb(): DatabaseType {
-  if (dbInstance) return dbInstance;
+export function getPrisma(): Promise<PrismaClient> {
+  if (prismaInstance) return prismaInstance;
   const file = dbPath();
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const db = new Database(file);
-  db.pragma("journal_mode = WAL");
-  migrate(db);
-  dbInstance = db;
-  return db;
+
+  // Prisma's SQLite connector expects an existing file. Opening in append mode
+  // creates a new empty database without truncating an existing one.
+  fs.closeSync(fs.openSync(/* turbopackIgnore: true */ file, "a"));
+  const prisma = new PrismaClient({ datasources: { db: { url: pathToFileURL(file).href } } });
+  const initializing = (async () => {
+    await prisma.$connect();
+    await prisma.$queryRaw`PRAGMA journal_mode = WAL`;
+    await prisma.$executeRaw`PRAGMA foreign_keys = ON`;
+    await prisma.$queryRaw`PRAGMA busy_timeout = 5000`;
+    await migrate(prisma);
+    return prisma;
+  })().catch(async (error: unknown) => {
+    if (prismaInstance === initializing) prismaInstance = null;
+    await prisma.$disconnect().catch(() => {});
+    throw error;
+  });
+  prismaInstance = initializing;
+  return initializing;
 }
 
-function migrate(db: DatabaseType): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS workspaces (
-      id          TEXT PRIMARY KEY,
-      name        TEXT NOT NULL,
-      root_path   TEXT NOT NULL UNIQUE,
-      created_at  TEXT NOT NULL,
-      updated_at  TEXT NOT NULL,
-      revision    TEXT
-    );
-  `);
-  const columns = db.prepare("PRAGMA table_info(workspaces)").all() as { name: string }[];
-  if (!columns.some((column) => column.name === "owner_id")) {
-    db.exec("ALTER TABLE workspaces ADD COLUMN owner_id TEXT");
-  }
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS workspaces_owner ON workspaces(owner_id);
-    CREATE TABLE IF NOT EXISTS workspace_ids (id TEXT PRIMARY KEY);
-    INSERT OR IGNORE INTO workspace_ids SELECT id FROM workspaces;
-    CREATE TABLE IF NOT EXISTS auth_users (
+async function migrate(db: PrismaClient): Promise<void> {
+  // Retain the previous idempotent bootstrap for both new and legacy databases.
+  // Prisma raw queries execute one SQL statement at a time.
+  await db.$transaction(async (tx) => {
+    await tx.$executeRaw`CREATE TABLE IF NOT EXISTS workspaces (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, revision TEXT
+    )`;
+    const columns = await tx.$queryRaw<{ name: string }[]>`PRAGMA table_info(workspaces)`;
+    if (!columns.some((column) => column.name === "owner_id")) {
+      await tx.$executeRaw`ALTER TABLE workspaces ADD COLUMN owner_id TEXT`;
+    }
+    await tx.$executeRaw`CREATE INDEX IF NOT EXISTS workspaces_owner ON workspaces(owner_id)`;
+    await tx.$executeRaw`CREATE TABLE IF NOT EXISTS workspace_ids (id TEXT PRIMARY KEY)`;
+    await tx.$executeRaw`INSERT OR IGNORE INTO workspace_ids SELECT id FROM workspaces`;
+    await tx.$executeRaw`CREATE TABLE IF NOT EXISTS auth_users (
       id TEXT PRIMARY KEY, issuer TEXT NOT NULL, subject TEXT NOT NULL,
       name TEXT NOT NULL, UNIQUE(issuer, subject)
-    );
-    CREATE TABLE IF NOT EXISTS auth_sessions (
+    )`;
+    await tx.$executeRaw`CREATE TABLE IF NOT EXISTS auth_sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES auth_users(id),
       expires_at INTEGER NOT NULL, id_token TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS auth_transactions (
+    )`;
+    await tx.$executeRaw`CREATE TABLE IF NOT EXISTS auth_transactions (
       token_hash TEXT PRIMARY KEY, state TEXT NOT NULL, nonce TEXT NOT NULL,
       verifier TEXT NOT NULL, return_to TEXT NOT NULL, expires_at INTEGER NOT NULL
-    );
-  `);
+    )`;
+  });
 }
 
-function rowToWorkspace(row: unknown): WorkspaceRow {
-  const r = row as Record<string, unknown>;
-  return {
-    id: r.id as string,
-    name: r.name as string,
-    rootPath: r.root_path as string,
-    createdAt: r.created_at as string,
-    updatedAt: r.updated_at as string,
-    revision: (r.revision as string | null) ?? null,
-  };
+const workspaceFields = {
+  id: true,
+  name: true,
+  rootPath: true,
+  createdAt: true,
+  updatedAt: true,
+  revision: true,
+} as const;
+
+export async function listWorkspaces(ownerId: string): Promise<WorkspaceRow[]> {
+  return (await getPrisma()).workspace.findMany({
+    where: { ownerId }, select: workspaceFields, orderBy: { createdAt: "asc" },
+  });
 }
 
-export function listWorkspaces(ownerId: string): WorkspaceRow[] {
-  const db = getDb();
-  return (
-    db
-      .prepare("SELECT id, name, root_path, created_at, updated_at, revision FROM workspaces WHERE owner_id = ? ORDER BY created_at ASC")
-      .all(ownerId) as unknown[]
-  ).map(rowToWorkspace);
+export async function getWorkspace(id: string): Promise<WorkspaceRow | null> {
+  return (await getPrisma()).workspace.findUnique({ where: { id }, select: workspaceFields });
 }
 
-export function getWorkspace(id: string): WorkspaceRow | null {
-  const db = getDb();
-  const row = db
-    .prepare("SELECT id, name, root_path, created_at, updated_at, revision FROM workspaces WHERE id = ?")
-    .get(id);
-  return row ? rowToWorkspace(row) : null;
+export async function getOwnedWorkspace(id: string, ownerId: string): Promise<WorkspaceRow | null> {
+  return (await getPrisma()).workspace.findFirst({ where: { id, ownerId }, select: workspaceFields });
 }
 
-export function getOwnedWorkspace(id: string, ownerId: string): WorkspaceRow | null {
-  const row = getDb().prepare("SELECT * FROM workspaces WHERE id = ? AND owner_id = ?").get(id, ownerId);
-  return row ? rowToWorkspace(row) : null;
-}
-
-export function getWorkspaceByRoot(rootPath: string): WorkspaceRow | null {
-  const db = getDb();
-  const row = db
-    .prepare("SELECT id, name, root_path, created_at, updated_at, revision FROM workspaces WHERE root_path = ?")
-    .get(rootPath);
-  return row ? rowToWorkspace(row) : null;
+export async function getWorkspaceByRoot(rootPath: string): Promise<WorkspaceRow | null> {
+  return (await getPrisma()).workspace.findUnique({ where: { rootPath }, select: workspaceFields });
 }
 
 // Never recycle a project identity: lingering agent sessions/CRs use this ID too.
-export function workspaceIdUsed(id: string): boolean {
-  return !!getDb().prepare("SELECT 1 FROM workspace_ids WHERE id = ?").get(id);
+export async function workspaceIdUsed(id: string): Promise<boolean> {
+  return !!(await (await getPrisma()).workspaceId.findUnique({ where: { id }, select: { id: true } }));
 }
 
-export function createWorkspace({ id, name, rootPath, ownerId }: NewWorkspace): WorkspaceRow {
+export async function createWorkspace({ id, name, rootPath, ownerId }: NewWorkspace): Promise<WorkspaceRow> {
   const workspaceId = id ?? generateId(name);
   if (!isValidWorkspaceId(workspaceId)) {
     throw new WorkspaceError("INVALID_WORKSPACE_ID", "工作区 ID 只能包含小写字母、数字和连字符。");
   }
-  const db = getDb();
-  if (workspaceIdUsed(workspaceId)) {
+  const db = await getPrisma();
+  if (await workspaceIdUsed(workspaceId)) {
     throw new WorkspaceError("WORKSPACE_EXISTS", "该 ID 的工作区已存在。");
   }
-  if (db.prepare("SELECT 1 FROM workspaces WHERE root_path = ?").get(rootPath)) {
+  if (await db.workspace.findUnique({ where: { rootPath }, select: { id: true } })) {
     throw new WorkspaceError("WORKSPACE_EXISTS", "该目录已被其他工作区使用。");
   }
   const now = new Date().toISOString();
-  db.transaction(() => {
-    db.prepare("INSERT INTO workspace_ids (id) VALUES (?)").run(workspaceId);
-    db.prepare(
-      "INSERT INTO workspaces (id, name, root_path, created_at, updated_at, revision, owner_id) VALUES (?, ?, ?, ?, ?, NULL, ?)",
-    ).run(workspaceId, name, rootPath, now, now, ownerId);
-  })();
-  return getWorkspace(workspaceId)!;
+  try {
+    return await db.$transaction(async (tx) => {
+      await tx.workspaceId.create({ data: { id: workspaceId } });
+      return tx.workspace.create({
+        data: { id: workspaceId, name, rootPath, createdAt: now, updatedAt: now, revision: null, ownerId },
+        select: workspaceFields,
+      });
+    });
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      throw new WorkspaceError("WORKSPACE_EXISTS", "该 ID 或目录的工作区已存在。");
+    }
+    throw error;
+  }
 }
 
-export function updateWorkspaceRevision(id: string, revision: string, ownerId: string): void {
-  const db = getDb();
-  db.prepare("UPDATE workspaces SET revision = ?, updated_at = ? WHERE id = ? AND owner_id = ?").run(
-    revision,
-    new Date().toISOString(),
-    id,
-    ownerId,
-  );
+export async function updateWorkspaceRevision(id: string, revision: string, ownerId: string): Promise<void> {
+  await (await getPrisma()).workspace.updateMany({
+    where: { id, ownerId }, data: { revision, updatedAt: new Date().toISOString() },
+  });
 }
 
-export function deleteWorkspace(id: string, ownerId: string): boolean {
-  const db = getDb();
-  const result = db.prepare("DELETE FROM workspaces WHERE id = ? AND owner_id = ?").run(id, ownerId);
-  return result.changes > 0;
+export async function deleteWorkspace(id: string, ownerId: string): Promise<boolean> {
+  const result = await (await getPrisma()).workspace.deleteMany({ where: { id, ownerId } });
+  return result.count > 0;
 }
 
 function generateId(name: string): string {

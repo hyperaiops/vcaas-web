@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Workspace {
+  id        String  @id
+  name      String
+  rootPath  String  @unique @map("root_path")
+  createdAt String  @map("created_at")
+  updatedAt String  @map("updated_at")
+  revision  String?
+  ownerId   String? @map("owner_id")
+
+  @@index([ownerId], map: "workspaces_owner")
+  @@map("workspaces")
+}
+
+model WorkspaceId {
+  id String @id
+
+  @@map("workspace_ids")
+}
+
+model AuthUser {
+  id       String        @id
+  issuer   String
+  subject  String
+  name     String
+  sessions AuthSession[]
+
+  @@unique([issuer, subject])
+  @@map("auth_users")
+}
+
+model AuthSession {
+  tokenHash String   @id @map("token_hash")
+  userId    String   @map("user_id")
+  // Legacy SQLite INTEGER values must be selected as CAST(expires_at AS TEXT).
+  expiresAt BigInt   @map("expires_at")
+  idToken   String   @map("id_token")
+  user      AuthUser @relation(fields: [userId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@map("auth_sessions")
+}
+
+model AuthTransaction {
+  tokenHash String @id @map("token_hash")
+  state     String
+  nonce     String
+  verifier  String
+  returnTo  String @map("return_to")
+  // Legacy SQLite INTEGER values must be selected as CAST(expires_at AS TEXT).
+  expiresAt BigInt @map("expires_at")
+
+  @@map("auth_transactions")
+}

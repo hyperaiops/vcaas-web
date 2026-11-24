@@ -21,8 +21,8 @@ export async function GET(request: Request) {
     });
     const jar = await cookies();
     const previous = jar.get(TRANSACTION_COOKIE)?.value;
-    if (previous) consumeLogin(previous);
-    const token = saveLogin({ state, nonce, verifier, returnTo: safeReturnTo(new URL(request.url).searchParams.get("returnTo")) });
+    if (previous) await consumeLogin(previous);
+    const token = await saveLogin({ state, nonce, verifier, returnTo: safeReturnTo(new URL(request.url).searchParams.get("returnTo")) });
     const response = NextResponse.redirect(url);
     response.cookies.set(TRANSACTION_COOKIE, token, { ...cookieOptions, maxAge: 600 });
     response.headers.set("Cache-Control", "no-store");

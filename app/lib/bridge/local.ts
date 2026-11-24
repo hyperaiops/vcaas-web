@@ -56,7 +56,8 @@ export class LocalPiTransport {
     if (!baseURL || !apiKey) {
       badConfig("PI_LITELLM_BASE_URL and PI_LITELLM_API_KEY are required for the local agent.");
     }
-    const workspace = getWorkspace(workspaceId);
+    const workspace = await getWorkspace(workspaceId);
+    signal?.throwIfAborted();
     if (!workspace) badConfig(`Unknown workspace: ${workspaceId}`);
     const root = await realpath(workspace.rootPath).catch(() => null);
     if (!root || !(await stat(root).catch(() => null))?.isDirectory()) {

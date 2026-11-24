@@ -27,7 +27,8 @@ type Transport =
   | { kind: "ws"; socket: WebSocket }
   | { kind: "local"; pi: LocalPiTransport };
 
-type Lease = { issuedAt: number; released: boolean; expires: number; subscribers: Set<(frame: string) => void>; timer?: ReturnType<typeof setTimeout> };
+type Subscriber = { send: (frame: string) => void; onRelease?: () => void };
+type Lease = { issuedAt: number; released: boolean; expires: number; subscribers: Set<Subscriber>; timer?: ReturnType<typeof setTimeout> };
 type TurnPhase = "running" | "retrying" | "compacting" | "stopping" | "uncertain" | "done" | "stopped" | "failed";
 type Turn = {
   id: string; clientId: string; promptId: string; phase: TurnPhase; text: string; activities: Activity[];
@@ -94,7 +95,12 @@ function release(w: Workspace, l: Lease) {
   if (l.released) return;
   l.released = true; l.expires = Date.now() + TOMBSTONE_MS;
   if (l.timer) clearTimeout(l.timer);
-  l.timer = undefined; l.subscribers.clear();
+  l.timer = undefined;
+  const subscribers = [...l.subscribers];
+  l.subscribers.clear();
+  for (const subscriber of subscribers) {
+    try { subscriber.onRelease?.(); } catch { /* Notify the remaining subscribers. */ }
+  }
 }
 function teardownTransport(t: Transport | null): Promise<void> {
   if (!t) return Promise.resolve();
@@ -207,14 +213,14 @@ function snapshot(g: Generation, clientId: string): string {
 function publishSnapshot(w: Workspace, g: Generation) {
   g.sequence++;
   for (const [clientId, lease] of w.leases) {
-    if (!lease.released) for (const send of lease.subscribers) send(snapshot(g, clientId));
+    if (!lease.released) for (const subscriber of lease.subscribers) subscriber.send(snapshot(g, clientId));
   }
 }
 function publishTurn(w: Workspace, g: Generation, t: Turn, event: object) {
   if (g.turn !== t) return;
   const frame = JSON.stringify({ type: "turn_event", version: 1, sequence: ++g.sequence, turnId: t.id, event });
   const lease = w.leases.get(t.clientId);
-  if (lease && !lease.released) for (const send of lease.subscribers) send(frame);
+  if (lease && !lease.released) for (const subscriber of lease.subscribers) subscriber.send(frame);
 }
 function setPhase(w: Workspace, g: Generation, t: Turn, phase: TurnPhase) {
   if (g.turn !== t || t.phase === phase) return;
@@ -527,13 +533,16 @@ export async function changeAgentSession(id: string, clientId: string, revision:
   }
 }
 
-export function subscribe(id: string, clientId: string, onFrame: (frame: string) => void): (() => void) | null {
+export function subscribe(id: string, clientId: string, onFrame: (frame: string) => void, onRelease?: () => void): (() => void) | null {
   const w = workspaces.get(id), l = w?.leases.get(clientId);
   if (!w || !l || l.released || w.fenced || !w.generation) return null;
   if (l.timer) clearTimeout(l.timer);
-  l.timer = undefined; l.subscribers.add(onFrame);
-  onFrame(snapshot(w.generation, clientId));
-  return () => { l.subscribers.delete(onFrame); arm(id, w, clientId, l); };
+  const subscriber = { send: onFrame, onRelease };
+  l.timer = undefined; l.subscribers.add(subscriber);
+  const unsubscribe = () => { l.subscribers.delete(subscriber); arm(id, w, clientId, l); };
+  try { onFrame(snapshot(w.generation, clientId)); }
+  catch (err) { unsubscribe(); throw err; }
+  return unsubscribe;
 }
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {

@@ -23,7 +23,7 @@ export async function resolveWorkspaceTree(
   try {
     const tree = await buildTree(workspace.rootPath, limits);
     if (workspace.revision !== tree.revision) {
-      updateWorkspaceRevision(workspace.id, tree.revision, auth.user.id);
+      await updateWorkspaceRevision(workspace.id, tree.revision, auth.user.id);
     }
     return { ok: true, workspace, tree };
   } catch (error) {

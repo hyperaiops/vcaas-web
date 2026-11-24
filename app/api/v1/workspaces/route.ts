@@ -16,7 +16,7 @@ function publicWorkspace(row: WorkspaceRow) {
 export async function GET() {
   const auth = await requireUser();
   if (!auth.ok) return auth.response;
-  return jsonResponse({ apiVersion: "v1", workspaces: listWorkspaces(auth.user.id).map(publicWorkspace) });
+  return jsonResponse({ apiVersion: "v1", workspaces: (await listWorkspaces(auth.user.id)).map(publicWorkspace) });
 }
 
 const SKIP_NAMES = new Set(["node_modules", ".next", "out", ".git", "tsconfig.tsbuildinfo", "package-lock.json"]);
@@ -40,7 +40,7 @@ export async function POST(request: Request) {
   await fs.mkdir(root, { recursive: true });
   for (let attempt = 0; attempt < 10; attempt++) {
     const finalId = id || `${slug}-${randomBytes(6).toString("hex")}`;
-    if (workspaceIdUsed(finalId)) {
+    if (await workspaceIdUsed(finalId)) {
       if (!id) continue;
       return errorResponse(409, "WORKSPACE_EXISTS", "该 ID 的工作区已存在。");
     }
@@ -60,7 +60,7 @@ export async function POST(request: Request) {
         recursive: true,
         filter: (source) => source === src || !SKIP_NAMES.has(path.basename(source)),
       });
-      const row = createWorkspace({ id: finalId, name, rootPath: workspacePath, ownerId: auth.user.id });
+      const row = await createWorkspace({ id: finalId, name, rootPath: workspacePath, ownerId: auth.user.id });
       return jsonResponse({ apiVersion: "v1", workspace: publicWorkspace(row) }, 201);
     } catch (error) {
       // Only remove the directory reserved by this request, never an existing project.

@@ -19,12 +19,15 @@ export async function GET(request: Request, { params }: Context) {
   const clientId = new URL(request.url).searchParams.get("clientId");
   if (!isClientId(clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。");
   const token = (await cookies()).get(SESSION_COOKIE)!.value;
-  const authorized = () => sessionUser(token)?.id === auth.user.id && !!getOwnedWorkspace(workspaceId, auth.user.id);
+  const authorized = async () => {
+    const user = await sessionUser(token);
+    return user?.id === auth.user.id && !!(await getOwnedWorkspace(workspaceId, auth.user.id));
+  };
   let subscribed = false;
-  const stream = guardedEventStream(request.signal, authorized, (send) => {
-    const unsubscribe = subscribe(workspaceId, clientId, send);
+  const stream = guardedEventStream(request.signal, authorized, (send, onRelease) => {
+    const unsubscribe = subscribe(workspaceId, clientId, send, onRelease);
     subscribed = unsubscribe !== null;
-    return unsubscribe ?? (() => {});
+    return unsubscribe;
   });
   // ReadableStream.start runs synchronously. Unknown/released leases must not
   // open an SSE response, which would cause EventSource to reconnect forever.

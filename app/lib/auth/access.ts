@@ -7,7 +7,7 @@ import { sessionUser } from "./store";
 
 export async function currentUser() {
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
-  return token ? sessionUser(token) : null;
+  return token ? await sessionUser(token) : null;
 }
 
 export function checkOrigin(request: Request): Response | null {
@@ -29,7 +29,7 @@ export async function requireUser(request?: Request) {
 export async function requireOwnedWorkspace(workspaceId: string, request?: Request) {
   const auth = await requireUser(request);
   if (!auth.ok) return auth;
-  const workspace = getOwnedWorkspace(workspaceId, auth.user.id);
+  const workspace = await getOwnedWorkspace(workspaceId, auth.user.id);
   if (!workspace) return { ok: false as const, response: errorResponse(404, "WORKSPACE_NOT_FOUND", "未找到该工作区。") };
   return { ...auth, workspace };
 }

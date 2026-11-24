@@ -162,6 +162,19 @@ running arbitrary coding commands inside the web server would expose server
 credentials and other users' files. Use per-workspace PiWorker RPC instead.
 Snapshots are served only through authenticated APIs; `/snapshots/*` is blocked.
 
+### SQLite and Prisma
+
+Application metadata and authentication queries use Prisma's SQLite connector
+with the existing database selected by `WORKSPACE_DB_PATH` (default
+`.data/workspaces.db`). Workspace files remain on disk. `pnpm dev` and `pnpm build`
+generate Prisma Client automatically; no `better-sqlite3` package is required.
+
+This change retains the existing idempotent startup schema upgrade, including
+legacy ownership and workspace ID initialization. It does not use Prisma Migrate
+or reset the database. Before upgrading an existing installation, stop all writers
+and take a SQLite-consistent backup, including any WAL state. Keep `AUTH_SESSION_KEY`
+unchanged to preserve existing encrypted sessions.
+
 ### Existing project ownership
 
 Migration preserves existing rows and files but leaves historical projects

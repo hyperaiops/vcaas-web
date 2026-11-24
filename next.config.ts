@@ -2,6 +2,8 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+  // Runtime databases and user workspaces must never be bundled into the image.
+  outputFileTracingExcludes: { "/*": ["./.data/**/*"] },
   allowedDevOrigins: ["vibe-coding.host"],
   // WebContainer requires cross-origin isolation (SharedArrayBuffer).
   async headers() {

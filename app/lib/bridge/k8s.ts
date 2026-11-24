@@ -87,7 +87,8 @@ export async function ensurePiWorker(workspaceId: string, signal?: AbortSignal):
   if (!isValidWorkspaceId(workspaceId)) {
     throw new K8sClientError("BAD_CONFIG", `Invalid workspace id: ${workspaceId}`);
   }
-  const workspace = getWorkspace(workspaceId);
+  const workspace = await getWorkspace(workspaceId);
+  signal?.throwIfAborted();
   if (!workspace) {
     throw new K8sClientError("UNKNOWN_WORKSPACE", `Unknown workspace: ${workspaceId}`);
   }

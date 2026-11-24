@@ -32,7 +32,7 @@ export async function GET(request: Request) {
     const config = authConfig();
     stage = "login-transaction";
     if (!transactionToken) throw new LoginCallbackError("LOGIN_COOKIE_MISSING");
-    const transaction = consumeLogin(transactionToken);
+    const transaction = await consumeLogin(transactionToken);
     if (!transaction) throw new LoginCallbackError("LOGIN_TRANSACTION_EXPIRED");
     // Do not trust the reverse proxy's Host header to determine the redirect URI.
     const callback = new URL(config.callback);
@@ -48,9 +48,9 @@ export async function GET(request: Request) {
     if (!claims?.sub || !tokens.id_token || !claims.exp) throw new LoginCallbackError("IDENTITY_CLAIMS_MISSING");
     const name = typeof claims.name === "string" ? claims.name : typeof claims.preferred_username === "string" ? claims.preferred_username : "用户";
     stage = "session-creation";
-    const session = createSession(claims.sub, name, tokens.id_token, claims.exp);
+    const session = await createSession(claims.sub, name, tokens.id_token, claims.exp);
     const previous = jar.get(SESSION_COOKIE)?.value;
-    if (previous) revokeSession(previous);
+    if (previous) await revokeSession(previous);
     response = NextResponse.redirect(new URL(transaction.returnTo, config.origin));
     response.cookies.set(SESSION_COOKIE, session.token, { ...cookieOptions, expires: new Date(session.expiresAt) });
   } catch (error) {

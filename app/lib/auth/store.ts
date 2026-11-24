@@ -1,6 +1,6 @@
 import "server-only";
 import { createHash, randomBytes, randomUUID, createCipheriv, createDecipheriv } from "node:crypto";
-import { getDb } from "../db";
+import { getPrisma } from "../db";
 import { authConfig } from "./config";
 
 export type User = { id: string; name: string };
@@ -22,47 +22,73 @@ function decrypt(value: string): string {
   return Buffer.concat([cipher.update(data.subarray(28)), cipher.final()]).toString("utf8");
 }
 
-export function saveLogin(transaction: LoginTransaction): string {
-  const db = getDb();
-  db.prepare("DELETE FROM auth_transactions WHERE expires_at <= ?").run(Date.now());
+export async function saveLogin(transaction: LoginTransaction): Promise<string> {
+  const db = await getPrisma();
+  await db.authTransaction.deleteMany({ where: { expiresAt: { lte: BigInt(Date.now()) } } });
   const token = randomToken();
-  db.prepare("INSERT INTO auth_transactions VALUES (?, ?, ?, ?, ?, ?)").run(
-    hash(token), transaction.state, transaction.nonce, transaction.verifier, transaction.returnTo, Date.now() + 600_000,
-  );
+  // Legacy SQLite columns are declared INTEGER. Prisma's native SQLite engine
+  // decodes returned INTEGER values as 32-bit even when the model uses BigInt.
+  // Do not return the millisecond timestamp from this write.
+  await db.authTransaction.create({
+    data: { tokenHash: hash(token), ...transaction, expiresAt: BigInt(Date.now() + 600_000) },
+    select: { tokenHash: true },
+  });
   return token;
 }
 
-export function consumeLogin(token: string): LoginTransaction | null {
-  const row = getDb().prepare("DELETE FROM auth_transactions WHERE token_hash = ? RETURNING *").get(hash(token)) as
-    { state: string; nonce: string; verifier: string; return_to: string; expires_at: number } | undefined;
-  if (!row || row.expires_at <= Date.now()) return null;
+export async function consumeLogin(token: string): Promise<LoginTransaction | null> {
+  const db = await getPrisma();
+  // Deleting and returning in one statement guarantees that only one callback can consume the token.
+  // Return the integer as text so even an out-of-range 64-bit timestamp is compared without precision loss.
+  const rows = await db.$queryRaw<{ state: string; nonce: string; verifier: string; return_to: string; expires_at: string }[]>`
+    DELETE FROM auth_transactions WHERE token_hash = ${hash(token)}
+    RETURNING state, nonce, verifier, return_to, CAST(expires_at AS TEXT) AS expires_at
+  `;
+  const row = rows[0];
+  if (!row || BigInt(row.expires_at) <= BigInt(Date.now())) return null;
   return { state: row.state, nonce: row.nonce, verifier: row.verifier, returnTo: row.return_to };
 }
 
-export function createSession(subject: string, name: string, idToken: string, tokenExpiry: number) {
-  const db = getDb();
+export async function createSession(subject: string, name: string, idToken: string, tokenExpiry: number): Promise<{ token: string; expiresAt: number }> {
+  const db = await getPrisma();
   const issuer = authConfig().issuer;
   const token = randomToken();
-  const expiresAt = Math.min(Date.now() + 8 * 60 * 60_000, tokenExpiry * 1000);
+  const expiresAt = Math.floor(Math.min(Date.now() + 8 * 60 * 60_000, tokenExpiry * 1000));
+  if (!Number.isFinite(tokenExpiry) || !Number.isSafeInteger(expiresAt)) {
+    throw new Error("Invalid session expiration");
+  }
   const encrypted = encrypt(idToken);
-  db.transaction(() => {
-    db.prepare("DELETE FROM auth_sessions WHERE expires_at <= ?").run(Date.now());
-    db.prepare(`INSERT INTO auth_users (id, issuer, subject, name) VALUES (?, ?, ?, ?)
-      ON CONFLICT(issuer, subject) DO UPDATE SET name = excluded.name`).run(randomUUID(), issuer, subject, name);
-    const user = db.prepare("SELECT id FROM auth_users WHERE issuer = ? AND subject = ?").get(issuer, subject) as { id: string };
-    db.prepare("INSERT INTO auth_sessions VALUES (?, ?, ?, ?)").run(hash(token), user.id, expiresAt, encrypted);
-  })();
+  await db.$transaction(async (tx) => {
+    await tx.authSession.deleteMany({ where: { expiresAt: { lte: BigInt(Date.now()) } } });
+    const user = await tx.authUser.upsert({
+      where: { issuer_subject: { issuer, subject } },
+      create: { id: randomUUID(), issuer, subject, name },
+      update: { name },
+      select: { id: true },
+    });
+    await tx.authSession.create({
+      data: { tokenHash: hash(token), userId: user.id, expiresAt: BigInt(expiresAt), idToken: encrypted },
+      select: { tokenHash: true },
+    });
+  });
   return { token, expiresAt };
 }
 
-export function sessionUser(token: string): User | null {
-  const user = getDb().prepare(`SELECT u.id, u.name FROM auth_sessions s JOIN auth_users u ON s.user_id = u.id
-    WHERE s.token_hash = ? AND s.expires_at > ? AND u.issuer = ?`).get(hash(token), Date.now(), authConfig().issuer) as User | undefined;
-  return user ?? null;
+export async function sessionUser(token: string): Promise<User | null> {
+  const db = await getPrisma();
+  const session = await db.authSession.findFirst({
+    where: { tokenHash: hash(token), expiresAt: { gt: BigInt(Date.now()) }, user: { issuer: authConfig().issuer } },
+    select: { user: { select: { id: true, name: true } } },
+  });
+  return session?.user ?? null;
 }
 
-export function revokeSession(token: string): string | null {
-  const row = getDb().prepare("DELETE FROM auth_sessions WHERE token_hash = ? RETURNING id_token").get(hash(token)) as { id_token: string } | undefined;
+export async function revokeSession(token: string): Promise<string | null> {
+  const db = await getPrisma();
+  const rows = await db.$queryRaw<{ id_token: string }[]>`
+    DELETE FROM auth_sessions WHERE token_hash = ${hash(token)} RETURNING id_token
+  `;
+  const row = rows[0];
   if (!row) return null;
   try { return decrypt(row.id_token); } catch { return null; }
 }

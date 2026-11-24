@@ -60,7 +60,7 @@ export async function DELETE(_request: Request, { params }: Context) {
   } catch {
     return errorResponse(500, "WORKSPACE_DELETE_FAILED", "无法删除工作区文件。");
   }
-  deleteWorkspace(workspaceId, auth.user.id);
+  await deleteWorkspace(workspaceId, auth.user.id);
   return jsonResponse({ apiVersion: "v1", deleted: workspaceId });
 }
 
