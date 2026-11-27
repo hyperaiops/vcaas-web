@@ -26,13 +26,13 @@ export async function POST(request: Request) {
   if (!auth.ok) return auth.response;
   let body: { name?: unknown; id?: unknown };
   try { body = await request.json(); } catch {
-    return errorResponse(400, "INVALID_REQUEST", "请求正文必须是有效的 JSON。");
+    return errorResponse(400, "INVALID_REQUEST", "请求正文必须是有效的 JSON。", { messageKey: "request.invalidJson" });
   }
-  if (!body || typeof body !== "object") return errorResponse(400, "INVALID_REQUEST", "请求正文必须是一个对象。");
+  if (!body || typeof body !== "object") return errorResponse(400, "INVALID_REQUEST", "请求正文必须是一个对象。", { messageKey: "request.bodyNotObject" });
   const name = typeof body.name === "string" ? body.name.trim() : "";
   const id = typeof body.id === "string" ? body.id.trim() : "";
-  if (!name) return errorResponse(400, "INVALID_REQUEST", "必须提供非空的 name 字段。");
-  if (id && !isValidWorkspaceId(id)) return errorResponse(400, "INVALID_WORKSPACE_ID", "工作区 ID 只能包含小写字母、数字和连字符。");
+  if (!name) return errorResponse(400, "INVALID_REQUEST", "必须提供非空的 name 字段。", { messageKey: "request.nameRequired" });
+  if (id && !isValidWorkspaceId(id)) return errorResponse(400, "INVALID_WORKSPACE_ID", "工作区 ID 只能包含小写字母、数字和连字符。", { messageKey: "workspace.invalidId" });
   // These are runtime volumes; the template is shipped explicitly by Docker.
   const root = path.resolve(/* turbopackIgnore: true */ process.env.WORKSPACE_FILES_ROOT ?? path.join(process.cwd(), ".data", "workspaces"));
   const src = path.resolve(/* turbopackIgnore: true */ process.env.TEMPLATE_DIR ?? path.join(process.cwd(), "template"));
@@ -42,7 +42,7 @@ export async function POST(request: Request) {
     const finalId = id || `${slug}-${randomBytes(6).toString("hex")}`;
     if (await workspaceIdUsed(finalId)) {
       if (!id) continue;
-      return errorResponse(409, "WORKSPACE_EXISTS", "该 ID 的工作区已存在。");
+      return errorResponse(409, "WORKSPACE_EXISTS", "该 ID 的工作区已存在。", { messageKey: "workspace.exists" });
     }
     const workspacePath = path.join(/* turbopackIgnore: true */ root, finalId);
     try {
@@ -51,9 +51,9 @@ export async function POST(request: Request) {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
         if (!id) continue;
-        return errorResponse(409, "WORKSPACE_EXISTS", "该 ID 的工作区已存在。");
+        return errorResponse(409, "WORKSPACE_EXISTS", "该 ID 的工作区已存在。", { messageKey: "workspace.exists" });
       }
-      return errorResponse(500, "WORKSPACE_CREATE_FAILED", "无法创建工作区目录。");
+      return errorResponse(500, "WORKSPACE_CREATE_FAILED", "无法创建工作区目录。", { messageKey: "workspace.createDirFailed" });
     }
     try {
       await fs.cp(src, workspacePath, {
@@ -65,9 +65,12 @@ export async function POST(request: Request) {
     } catch (error) {
       // Only remove the directory reserved by this request, never an existing project.
       await fs.rm(workspacePath, { recursive: true, force: true });
-      if (error instanceof WorkspaceError) return errorResponse(409, error.code, error.message);
-      return errorResponse(500, "WORKSPACE_CREATE_FAILED", "无法初始化工作区。");
+      if (error instanceof WorkspaceError) {
+        return errorResponse(409, error.code, error.message,
+          error.messageKey ? { messageKey: error.messageKey, args: error.args } : undefined);
+      }
+      return errorResponse(500, "WORKSPACE_CREATE_FAILED", "无法初始化工作区。", { messageKey: "workspace.initFailed" });
     }
   }
-  return errorResponse(409, "WORKSPACE_EXISTS", "无法分配工作区 ID。");
+  return errorResponse(409, "WORKSPACE_EXISTS", "无法分配工作区 ID。", { messageKey: "workspace.idAllocationFailed" });
 }

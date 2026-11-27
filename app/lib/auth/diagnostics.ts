@@ -1,4 +1,5 @@
 import "server-only";
+import { formatApiMessage, type ApiMessageArgs, type ApiMessageKey } from "@/app/lib/i18n/api-messages";
 
 type Diagnostic = { reason: string; expectedAlgorithm?: string; receivedAlgorithm?: string };
 const algorithms = new Set(["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "HS256", "HS384", "HS512", "EdDSA", "none"]);
@@ -44,12 +45,18 @@ export function oidcDiagnostic(error: unknown): Diagnostic {
   return { reason: "UNCLASSIFIED" };
 }
 
-export function oidcFailureHint(diagnostic: Diagnostic): string | undefined {
+// Localized failure hint: stable messageKey + safe args (only algorithm names
+// from a fixed allowlist) alongside the pre-rendered zh-CN text.
+export function oidcFailureHint(diagnostic: Diagnostic): { text: string; messageKey: ApiMessageKey; args?: ApiMessageArgs } | undefined {
   if (diagnostic.reason === "JWT_ALGORITHM_MISMATCH") {
-    return `Authing 身份令牌的签名算法与应用配置不一致。预期算法：${diagnostic.expectedAlgorithm ?? "已配置的算法"}；实际算法：${diagnostic.receivedAlgorithm ?? "不支持的算法"}。请将 Authing 应用的 ID Token 签名算法设为 RS256，保存后重新登录。系统未跳过签名校验。`;
+    const args = {
+      expectedAlgorithm: diagnostic.expectedAlgorithm ?? "已配置的算法",
+      receivedAlgorithm: diagnostic.receivedAlgorithm ?? "不支持的算法",
+    };
+    return { text: formatApiMessage("auth.hintJwtAlgorithm", args), messageKey: "auth.hintJwtAlgorithm", args };
   }
-  if (diagnostic.reason.startsWith("STATE_")) return "登录状态不匹配。请关闭旧的登录标签页，在当前浏览器从网站首页重新发起一次登录。请勿重复使用或刷新旧的回调链接。";
-  if (diagnostic.reason === "JWT_SIGNATURE_INVALID") return "身份令牌签名校验失败。请联系管理员检查应用的 issuer、JWKS 公钥端点及 Authing 签名密钥配置，不要关闭签名校验。";
-  if (diagnostic.reason.startsWith("TOKEN_RESPONSE_")) return "Authing 返回的令牌响应缺少有效的必填字段。请联系管理员检查应用的 OIDC 授权码配置和令牌端点。";
+  if (diagnostic.reason.startsWith("STATE_")) return { text: formatApiMessage("auth.hintStateMismatch"), messageKey: "auth.hintStateMismatch" };
+  if (diagnostic.reason === "JWT_SIGNATURE_INVALID") return { text: formatApiMessage("auth.hintJwtSignature"), messageKey: "auth.hintJwtSignature" };
+  if (diagnostic.reason.startsWith("TOKEN_RESPONSE_")) return { text: formatApiMessage("auth.hintTokenResponse"), messageKey: "auth.hintTokenResponse" };
   return undefined;
 }

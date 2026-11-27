@@ -2,11 +2,19 @@
 
 Browser-based IDE with a coding agent (PI) on the left and a live WebContainer preview on the right.
 
-## 中文界面与字体
+## 界面语言与字体
 
-平台仅面向中文用户，不配置多语言路由、语言切换或国际化依赖。
-首页、工作区、聊天、编辑器、预览及登录提示使用简体中文；代码、文件名、用户内容、
-终端进程输出和必要的技术名称保持原样。
+平台界面支持简体中文和英文。登录页、工作区列表和编辑器都提供「中文 / English」切换；
+用户选择保存在浏览器 localStorage（key `sxym-locale`），默认简体中文。网址、登录回调和
+API 路径不随语言变化，也没有按语言索引的独立地址。
+
+只翻译平台自身文案：首页、工作区、聊天、编辑器、预览及登录提示支持双语；用户项目内容、
+代码、文件名、AI 回复、终端进程输出和预览应用保持原样。切换语言不会刷新页面或重建
+WebContainer、Agent 会话；Monaco 编辑器的内置界面语言在首次加载后保持，下次刷新页面生效。
+
+国际化实现位于 `app/lib/i18n/`：`zhCN`（`messages.ts`）是基准字典，其类型是所有语言
+字典的契约；新增或修改文案时必须同时更新 `en.ts`，文案用函数或参数插值，不拼接句子片段。
+服务端错误在 `app/lib/i18n/api-messages.ts` 维护稳定的 `messageKey` 与安全参数。
 
 首页展示商业咨询 QQ 群号 `1135649093` 和微信号 `HyperDevOps`。可通过服务端环境变量
 `COMMERCIAL_QQ_GROUP_URL` 配置 `https://qm.qq.com/…` 或 `https://jq.qq.com/…` 的官方入群链接；

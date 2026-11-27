@@ -53,12 +53,12 @@ export async function DELETE(_request: Request, { params }: Context) {
   try {
     await forceShutdown(workspaceId);
   } catch {
-    return errorResponse(503, "WORKSPACE_AGENT_SHUTDOWN_FAILED", "无法停止工作区智能助手，请稍后重试删除。");
+    return errorResponse(503, "WORKSPACE_AGENT_SHUTDOWN_FAILED", "无法停止工作区智能助手，请稍后重试删除。", { messageKey: "workspace.agentShutdownFailed" });
   }
   try {
     await fs.rm(workspace.rootPath, { recursive: true, force: true });
   } catch {
-    return errorResponse(500, "WORKSPACE_DELETE_FAILED", "无法删除工作区文件。");
+    return errorResponse(500, "WORKSPACE_DELETE_FAILED", "无法删除工作区文件。", { messageKey: "workspace.deleteFailed" });
   }
   await deleteWorkspace(workspaceId, auth.user.id);
   return jsonResponse({ apiVersion: "v1", deleted: workspaceId });

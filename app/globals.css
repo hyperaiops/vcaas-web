@@ -75,3 +75,13 @@ body {
   .brand-button { transition: none; }
   .brand-button:not(:disabled):hover { transform: none; }
 }
+
+/* Minimal i18n support: keep Latin/CJK fallback ordering per locale. */
+:root {
+  --font-ui-en: system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+html[lang="en"] body,
+html[lang="en"] {
+  font-family: var(--font-ui-en);
+  line-break: normal;
+}

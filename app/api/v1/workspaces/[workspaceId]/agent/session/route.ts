@@ -12,11 +12,11 @@ export async function GET(request: Request, { params }: Context) {
   const auth = await requireOwnedWorkspace(workspaceId, request);
   if (!auth.ok) return auth.response;
   const clientId = new URL(request.url).searchParams.get("clientId");
-  if (!isClientId(clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。");
+  if (!isClientId(clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。", { messageKey: "agent.invalidLease" });
   try {
     return jsonResponse(await getCurrentTranscript(workspaceId, clientId));
   } catch (error) {
-    return agentError(error, 503, "AGENT_HISTORY_FAILED", "无法读取编程助手会话。");
+    return agentError(error, 503, "AGENT_HISTORY_FAILED", "无法读取编程助手会话。", "agent.historyFailed");
   }
 }
 
@@ -25,13 +25,13 @@ export async function POST(request: Request, { params }: Context) {
   const auth = await requireOwnedWorkspace(workspaceId, request);
   if (!auth.ok) return auth.response;
   const body = await readAgentBody(request);
-  if (!isClientId(body.clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。");
+  if (!isClientId(body.clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。", { messageKey: "agent.invalidLease" });
   if (!isClientId(body.revision) || (body.action !== "new" && body.action !== "restore")) {
-    return errorResponse(400, "INVALID_SESSION_ACTION", "请刷新页面后重试。");
+    return errorResponse(400, "INVALID_SESSION_ACTION", "请刷新页面后重试。", { messageKey: "agent.invalidSessionAction" });
   }
   try {
     return jsonResponse(await changeAgentSession(workspaceId, body.clientId, body.revision, body.action, body.confirmMigration === true));
   } catch (error) {
-    return agentError(error, 503, "AGENT_SESSION_FAILED", "无法切换编程助手会话。");
+    return agentError(error, 503, "AGENT_SESSION_FAILED", "无法切换编程助手会话。", "agent.sessionFailed");
   }
 }

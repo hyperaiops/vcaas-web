@@ -22,6 +22,13 @@ FROM base AS runtime
 ENV NODE_ENV=production \
     HOSTNAME=0.0.0.0 \
     PORT=3000
+# Prisma's query engine (libquery_engine-debian-openssl-3.0.x) links libssl.so.3
+# and libcrypto.so.3 at runtime; the slim base image ships neither, which makes
+# every Prisma call (auth login/session store, workspace DB) throw. Install
+# openssl in the runtime stage — without it /auth/login returns 503.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
 RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --create-home app \
     && mkdir -p /app/.data/db /app/.data/workspaces /app/.data/snapshots \
     && chown -R app:app /app

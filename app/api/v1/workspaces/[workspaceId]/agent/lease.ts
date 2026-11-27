@@ -1,4 +1,5 @@
 import { errorResponse } from "@/app/lib/workspace/api-helpers";
+import type { ApiMessageKey } from "@/app/lib/i18n/api-messages";
 
 export function isClientId(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
@@ -20,10 +21,10 @@ export function parseLease(body: Record<string, unknown>) {
   return { clientId: body.clientId, issuedAt: body.issuedAt };
 }
 
-export function agentError(error: unknown, fallbackStatus: number, code: string, message: string) {
+export function agentError(error: unknown, fallbackStatus: number, code: string, message: string, messageKey: ApiMessageKey) {
   if (error !== null && typeof error === "object" && "status" in error &&
       typeof error.status === "number" && Number.isInteger(error.status) && error.status >= 400 && error.status <= 599) {
-    return errorResponse(error.status, "code" in error && typeof error.code === "string" ? error.code : code, message);
+    return errorResponse(error.status, "code" in error && typeof error.code === "string" ? error.code : code, message, { messageKey });
   }
-  return errorResponse(fallbackStatus, code, message);
+  return errorResponse(fallbackStatus, code, message, { messageKey });
 }

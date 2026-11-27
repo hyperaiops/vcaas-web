@@ -17,7 +17,7 @@ export async function GET(request: Request, { params }: Context) {
   const auth = await requireOwnedWorkspace(workspaceId, request);
   if (!auth.ok) return auth.response;
   const clientId = new URL(request.url).searchParams.get("clientId");
-  if (!isClientId(clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。");
+  if (!isClientId(clientId)) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。", { messageKey: "agent.invalidLease" });
   const token = (await cookies()).get(SESSION_COOKIE)!.value;
   const authorized = async () => {
     const user = await sessionUser(token);

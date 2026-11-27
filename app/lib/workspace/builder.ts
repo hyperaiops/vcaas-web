@@ -22,6 +22,7 @@ import type { Stats } from "node:fs";
 import type { TreeNode, WorkspaceLimits } from "./types";
 import { getWorkspaceLimits } from "./limits";
 import { isIgnoredName } from "./paths";
+import type { ApiMessageArgs, ApiMessageKey } from "@/app/lib/i18n/api-messages";
 
 export type BuiltTree = {
   root: TreeNode;
@@ -39,10 +40,16 @@ type WalkState = {
 
 export class WorkspaceTreeError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  messageKey?: ApiMessageKey;
+  args?: ApiMessageArgs;
+  constructor(code: string, message: string, localization?: { messageKey: ApiMessageKey; args?: ApiMessageArgs }) {
     super(message);
     this.code = code;
     this.name = "WorkspaceTreeError";
+    if (localization) {
+      this.messageKey = localization.messageKey;
+      this.args = localization.args;
+    }
   }
 }
 
@@ -54,12 +61,13 @@ export async function buildTree(
   try {
     const stat = await fs.stat(absolute);
     if (!stat.isDirectory()) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区根路径不是目录。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区根路径不是目录。", { messageKey: "tree.rootNotDirectory" });
     }
   } catch {
     throw new WorkspaceTreeError(
       "WORKSPACE_INVALID",
       "无法检查工作区根目录。",
+      { messageKey: "tree.rootUncheckable" },
     );
   }
 
@@ -80,14 +88,17 @@ async function walk(
   state: WalkState,
 ): Promise<TreeNode> {
   if (depth > state.limits.maxDepth) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区目录层级超过 ${state.limits.maxDepth} 层的上限。`);
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区目录层级超过 ${state.limits.maxDepth} 层的上限。`, {
+      messageKey: "tree.depthLimit",
+      args: { maxDepth: state.limits.maxDepth },
+    });
   }
   const dir = relative ? path.join(absoluteRoot, relative) : absoluteRoot;
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
   } catch {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法读取工作区目录。");
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法读取工作区目录。", { messageKey: "tree.dirUnreadable" });
   }
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
@@ -96,7 +107,7 @@ async function walk(
     const name = entry.name;
     if (isIgnoredName(name)) continue;
     if (name === "." || name === ".." || /[\\/]\x00/.test(name) || name.includes("\0")) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区包含不安全的文件或目录名称。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区包含不安全的文件或目录名称。", { messageKey: "tree.unsafeName" });
     }
     const childRelative = relative ? `${relative}/${name}` : name;
     const childAbsolute = path.join(absoluteRoot, childRelative);
@@ -104,10 +115,13 @@ async function walk(
     try {
       info = await fs.lstat(childAbsolute);
     } catch {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法检查工作区文件或目录。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法检查工作区文件或目录。", { messageKey: "tree.entryUncheckable" });
     }
     if (info.isSymbolicLink()) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区包含不支持的符号链接“${childRelative}”。`);
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区包含不支持的符号链接“${childRelative}”。`, {
+        messageKey: "tree.symlink",
+        args: { path: childRelative },
+      });
     }
     if (info.isDirectory()) {
       state.hash.update(`D\x00${childRelative}\x00`);
@@ -115,24 +129,30 @@ async function walk(
       continue;
     }
     if (!info.isFile()) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区包含不支持的文件类型“${childRelative}”。`);
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", `工作区包含不支持的文件类型“${childRelative}”。`, {
+        messageKey: "tree.unsupportedFileType",
+        args: { path: childRelative },
+      });
     }
     if (info.size > state.limits.maxFileBytes) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", `文件“${childRelative}”超过单个文件的大小上限。`);
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", `文件“${childRelative}”超过单个文件的大小上限。`, {
+        messageKey: "tree.fileTooLarge",
+        args: { path: childRelative },
+      });
     }
     state.files += 1;
     if (state.files > state.limits.maxFiles) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区文件数量超过上限。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区文件数量超过上限。", { messageKey: "tree.fileCountLimit" });
     }
     state.total += info.size;
     if (state.total > state.limits.maxTotalBytes) {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区总大小超过上限。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "工作区总大小超过上限。", { messageKey: "tree.totalSizeLimit" });
     }
     let contents: Buffer;
     try {
       contents = await fs.readFile(childAbsolute);
     } catch {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法读取工作区文件。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "无法读取工作区文件。", { messageKey: "tree.fileUnreadable" });
     }
     state.hash.update(`F\x00${childRelative}\x00${contents.length}\x00`);
     state.hash.update(contents);

@@ -50,7 +50,7 @@ export async function findSnapshot(revision: string): Promise<FoundSnapshot | nu
     return { path: artifact, size: data.byteLength, sha256, buffer: data };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw new WorkspaceTreeError("SNAPSHOT_LOOKUP_FAILED", "无法检查工作区快照。");
+    throw new WorkspaceTreeError("SNAPSHOT_LOOKUP_FAILED", "无法检查工作区快照。", { messageKey: "snapshot.lookupFailed" });
   }
 }
 
@@ -85,7 +85,7 @@ export async function publishSnapshot(revision: string, contents: Buffer): Promi
 // build-snapshot.mjs.
 async function materializeTree(root: TreeNode, directory: string): Promise<void> {
   if (!root || root.kind !== "directory" || !root.children) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树的根目录无效。");
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树的根目录无效。", { messageKey: "tree.invalidRoot" });
   }
   for (const [name, node] of Object.entries(root.children)) {
     assertSafeName(name);
@@ -96,25 +96,25 @@ async function materializeTree(root: TreeNode, directory: string): Promise<void>
       continue;
     }
     if (node.kind !== "file" || typeof node.contents !== "string") {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含无效的文件节点。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含无效的文件节点。", { messageKey: "tree.invalidFileNode" });
     }
     if (node.encoding === "utf-8") {
       await fs.writeFile(target, node.contents, "utf8");
     } else if (node.encoding === "base64") {
       const data = Buffer.from(node.contents, "base64");
       if (data.toString("base64") !== node.contents) {
-        throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含无效的 base64 内容。");
+        throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含无效的 base64 内容。", { messageKey: "tree.invalidBase64" });
       }
       await fs.writeFile(target, data);
     } else {
-      throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含不支持的文件编码。");
+      throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含不支持的文件编码。", { messageKey: "tree.unsupportedEncoding" });
     }
   }
 }
 
 function assertSafeName(name: string): void {
   if (!name || name === "." || name === ".." || /[\\/\0]/.test(name)) {
-    throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含不安全的文件或目录名称。");
+    throw new WorkspaceTreeError("WORKSPACE_INVALID", "文件树包含不安全的文件或目录名称。", { messageKey: "tree.unsafeName" });
   }
 }
 

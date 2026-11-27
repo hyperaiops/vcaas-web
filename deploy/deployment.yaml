@@ -82,7 +82,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: webcontainer
-          image: ccr.ccs.tencentyun.com/vcaas/platform:release-20261115-164432
+          image: ccr.ccs.tencentyun.com/vcaas/platform:release-20261127-1154
           imagePullPolicy: IfNotPresent
           workingDir: /app
           ports:

@@ -4,6 +4,7 @@ import * as oidc from "openid-client";
 import { authConfig, cookieOptions, TRANSACTION_COOKIE } from "@/app/lib/auth/config";
 import { oidcClient, safeReturnTo } from "@/app/lib/auth/oidc";
 import { consumeLogin, saveLogin } from "@/app/lib/auth/store";
+import { formatApiMessage } from "@/app/lib/i18n/api-messages";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -15,8 +16,12 @@ export async function GET(request: Request) {
     const verifier = oidc.randomPKCECodeVerifier();
     const state = oidc.randomState();
     const nonce = oidc.randomNonce();
+    // Prefer the user's browser language for the identity provider UI; fall back
+    // to Simplified Chinese. Only allowlisted values are passed to the OIDC provider.
+    const browserLocale = (request.headers.get("accept-language") ?? "").split(",")[0]?.trim().toLowerCase() ?? "";
+    const uiLocales = browserLocale.startsWith("en") ? "en" : "zh-CN";
     const url = oidc.buildAuthorizationUrl(client, {
-      redirect_uri: config.callback, response_type: "code", scope: "openid profile email", ui_locales: "zh-CN",
+      redirect_uri: config.callback, response_type: "code", scope: "openid profile email", ui_locales: uiLocales,
       code_challenge: await oidc.calculatePKCECodeChallenge(verifier), code_challenge_method: "S256", state, nonce,
     });
     const jar = await cookies();
@@ -28,6 +33,9 @@ export async function GET(request: Request) {
     response.headers.set("Cache-Control", "no-store");
     return response;
   } catch {
-    return new Response("登录服务暂时不可用，请稍后重试或联系管理员检查认证配置。", { status: 503, headers: { "Cache-Control": "no-store" } });
+    return new Response(formatApiMessage("auth.loginUnavailable"), {
+      status: 503,
+      headers: { "Cache-Control": "no-store", "x-auth-message-key": "auth.loginUnavailable" },
+    });
   }
 }

@@ -3,17 +3,27 @@
 import { useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { authenticatedFetch } from "@/app/lib/auth/client";
+import { useMessages } from "@/app/lib/i18n/context";
+import type { Messages } from "@/app/lib/i18n/messages";
 import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
 import IconTooltip from "./IconTooltip";
+
+type PreviewKey = keyof Messages["preview"];
+
+// Localized loading fallback for the lazily loaded code editor.
+function CodeEditorLoading() {
+  const pv = useMessages().preview;
+  return (
+    <div className="flex h-full items-center justify-center text-sm text-neutral-500">
+      {pv.loadingFallback}
+    </div>
+  );
+}
 
 // Monaco is large — only load the code editor when the Code tab is opened.
 const CodeEditor = dynamic(() => import("@/app/components/CodeEditor"), {
   ssr: false,
-  loading: () => (
-    <div className="flex h-full items-center justify-center text-sm text-neutral-500">
-      正在加载编辑器…
-    </div>
-  ),
+  loading: () => <CodeEditorLoading />,
 });
 
 type View = "preview" | "code";
@@ -73,7 +83,25 @@ function getWebContainer(): Promise<WebContainer> {
 
 type Props = { workspaceId: string | null };
 
+// A stored preview error: stable catalog key plus interpolation vars, rendered
+// via the dictionary at display time so locale switches re-render it.
+type PreviewError = { key: PreviewKey; vars?: Record<string, string> };
+
+function renderPreviewError(pv: Messages["preview"], error: PreviewError): string {
+  const leaf = pv[error.key];
+  // Keys are stored with the exact vars their template needs; the union of
+  // leaf signatures can't express that, so dispatch through a loose callable.
+  return typeof leaf === "function" ? (leaf as (vars: Record<string, string>) => string)(error.vars ?? {}) : leaf;
+}
+
 export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Props) {
+  const pv = useMessages().preview;
+  // The boot effect must not re-run on locale switch (it would remount the
+  // workspace), so localized terminal/status writes read the catalog via ref.
+  const pvRef = useRef(pv);
+  useEffect(() => {
+    pvRef.current = pv;
+  }, [pv]);
   const terminalRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const terminalWriteRef = useRef<((message: string) => void) | null>(null);
@@ -84,7 +112,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
   const [consoleSize, setConsoleSize] = useState<ConsoleSize>("compact");
   const [status, setStatus] = useState<Status>("booting");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<PreviewError | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [refreshKey, setRefreshKey] = useState(0);
   const [view, setView] = useState<View>("preview");
@@ -125,8 +153,8 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
       const now = Date.now();
       if (now - windowStart >= 1000 || now < windowStart) { windowStart = now; count = 0; errorCount = 0; }
       if ((data.level === "error-location" ? errorCount++ : count++) >= 50) return;
-      const label = data.level === "error-location" ? "错误位置" : data.level;
-      terminalWriteRef.current?.(`[预览 ${label}] ${safePreviewText(data.text)}\r\n`);
+      const label = data.level === "error-location" ? pvRef.current.previewLabelErrorLocation : data.level;
+      terminalWriteRef.current?.(`${pvRef.current.termPreviewConsoleTag({ label })} ${safePreviewText(data.text)}\r\n`);
     };
     window.addEventListener("message", onMessage);
     return () => {
@@ -167,12 +195,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         // No cached snapshot yet — trigger generation, then retry once.
         const gen = await authenticatedFetch(url, { method: "POST", signal: controller.signal });
         if (!gen.ok) {
-          throw new Error(`生成工作区快照失败（${gen.status}），请稍后重试。`);
+          throw new Error(`snapshot generation failed (${gen.status})`);
         }
         return gen;
       }
       if (!response.ok) {
-        throw new Error(`加载工作区快照失败（${response.status}），请稍后重试。`);
+        throw new Error(`snapshot load failed (${response.status})`);
       }
       return response;
     }
@@ -182,7 +210,7 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
       const response = await fetchSnapshot(url);
       if (cancelled) return;
       if (response.headers.get("x-webcontainer-snapshot-format") !== "webcontainer-snapshot-v1") {
-        throw new Error("服务器返回的 WebContainer 快照格式不受支持。");
+        throw new Error("unsupported webcontainer snapshot format");
       }
       await wc.mount(new Uint8Array(await response.arrayBuffer()));
     }
@@ -236,14 +264,14 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         observer = new ResizeObserver(fit);
         observer.observe(host);
         fit();
-        writer("[系统] 正在启动 WebContainer…\r\n");
+        writer(pvRef.current.termBooting);
 
         // Singleton boot — safe to call on every effect run (refresh).
         const container = await getWebContainer();
         if (cancelled) return;
         unsubscribe.push(container.on("error", ({ message }) => {
           writer?.(`[WebContainer] ${safePreviewText(message)}\r\n`);
-          if (!cancelled) { setStatus("error"); setError("WebContainer 运行异常，请查看终端输出后重试。"); }
+          if (!cancelled) { setStatus("error"); setError({ key: "errorWebcontainerRuntime" }); }
         }));
         unsubscribe.push(container.on("preview-message", (message) => {
           if (message.port !== previewPortRef.current) return;
@@ -258,10 +286,10 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
               }
             } catch { /* Unknown sources remain visible. */ }
           }
-          writer?.(`[预览 error] ${detail.slice(0, 4000)}\r\n`);
+          writer?.(`${pvRef.current.termPreviewErrorTag} ${detail.slice(0, 4000)}\r\n`);
           if (message.stack) {
             const stack = safePreviewStack(message.stack);
-            if (stack && stack !== detail) writer?.(`[预览堆栈] ${stack}\r\n`);
+            if (stack && stack !== detail) writer?.(`${pvRef.current.termPreviewStackTag} ${stack}\r\n`);
           }
         }));
         unsubscribe.push(container.on("server-ready", (port, url) => {
@@ -305,13 +333,13 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         if (cancelled) return;
 
         setStatus("loading");
-        writer?.("[系统] 正在加载工作区快照（第一次可能较慢）…\r\n");
+        writer?.(pvRef.current.termLoadingSnapshot);
         await mountWorkspace(container);
         if (cancelled) return;
 
         const pipeOutput = (process: WebContainerProcess) => {
           void process.output.pipeTo(new WritableStream({ write(data: string) { writer?.(data); } })).catch(() => {
-            if (!cancelled && !stoppedRef.current) writer?.("[系统] 无法读取进程输出。\r\n");
+            if (!cancelled && !stoppedRef.current) writer?.(pvRef.current.termOutputLost);
           });
         };
         shell = await own(container.spawn("jsh", { terminal: { cols: xterm.cols, rows: xterm.rows }, env: PACKAGE_MANAGER_ENV }));
@@ -320,18 +348,18 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         fit();
 
         setStatus("installing");
-        writer?.("[系统] 正在安装依赖（第一次可能较慢）…\r\n");
+        writer?.(pvRef.current.termInstalling);
         // Use the browser container's mirror and force the portable CSS binding.
         const install = await own(container.spawn("pnpm", ["install", "--prefer-offline"], {
           env: { ...PACKAGE_MANAGER_ENV, LIGHTNINGCSS_FORCE_WASM: "1" },
         }));
         if (!install) return;
         pipeOutput(install);
-        if ((await install.exit) !== 0) throw new Error("WebContainer 中的 `pnpm install` 执行失败。");
+        if ((await install.exit) !== 0) throw new Error("`pnpm install` failed inside the WebContainer");
         if (cancelled) return;
 
         setStatus("starting");
-        writer?.("[系统] 正在启动开发服务器…\r\n");
+        writer?.(pvRef.current.termStarting);
         // Clear potentially stale WebContainer build output before starting.
         const clean = await own(container.spawn("rm", ["-rf", ".next"]));
         if (!clean) return;
@@ -346,23 +374,23 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         void runningDev.exit.then((code) => {
           if (devRef.current === runningDev) devRef.current = null;
           if (!cancelled && code !== 0 && !stoppedRef.current) {
-            writer?.(`[系统] 开发服务器已退出，退出码为 ${code}。\r\n`);
+            writer?.(pvRef.current.termDevExited({ code: String(code) }));
             setStatus("error");
-            setError(`开发服务器已退出，退出码为 ${code}。请查看下方终端输出。`);
+            setError({ key: "errorDevServerExited", vars: { code: String(code) } });
           }
         }).catch(() => {
           if (!cancelled && !stoppedRef.current) {
-            writer?.("[系统] 无法确认开发服务器状态。\r\n");
+            writer?.(pvRef.current.termDevStateUnknown);
             setStatus("error");
-            setError("开发服务器状态异常，请查看下方终端输出。");
+            setError({ key: "errorDevServerState" });
           }
         });
       } catch (reason) {
         if (!cancelled) {
           console.error("WebContainer startup failed", reason);
-          writer?.("[系统] 启动失败，请检查上方终端输出后重试。\r\n");
+          writer?.(pvRef.current.termBootFailed);
           setStatus("error");
-          setError("WebContainer 启动失败，请查看终端输出后重试。");
+          setError({ key: "errorBootFailed" });
         }
       }
     }
@@ -411,13 +439,13 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         pendingSource = event.source as Window | null;
         popup = window.open(data.url, "azure-login", "width=600,height=700");
         if (!popup) {
-          forward({ error: "弹出窗口被拦截，请允许此网站打开弹出窗口后重试。" });
+          forward({ error: pvRef.current.ssoPopupBlocked });
           return;
         }
         closedWatcher = window.setInterval(() => {
           if (popup?.closed) {
             window.clearInterval(closedWatcher);
-            forward({ error: "登录尚未完成，登录窗口已关闭。" });
+            forward({ error: pvRef.current.ssoPopupClosed });
           }
         }, 500);
       } else if (data.type === "sso:code") {
@@ -463,12 +491,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
     previewUrlRef.current = null;
     previewPortRef.current = null;
     clearBridgeProbe(bridgeProbeRef);
-    terminalWriteRef.current?.("[系统] 开发服务器已停止。\r\n");
+    terminalWriteRef.current?.(pvRef.current.termStopped);
     setPreviewUrl(null);
     setStatus("stopped");
   }
 
-  const statusLabel: Record<Status, string> = { booting: "正在启动容器…", loading: "正在加载工作区…", installing: "正在安装依赖…（第一次可能较慢）", starting: "正在启动服务器…", ready: "运行中", stopped: "已停止", error: "启动失败" };
+  const statusLabel: Record<Status, string> = { booting: pv.statusBooting, loading: pv.statusLoading, installing: pv.statusInstalling, starting: pv.statusStarting, ready: pv.statusReady, stopped: pv.statusStopped, error: pv.statusError };
 
   const terminalHeight = consoleSize === "expanded" ? "50%" : "clamp(80px, 25%, 150px)";
 
@@ -499,11 +527,11 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         {/* Preview / Code tab toggle */}
         <div className="flex shrink-0 rounded-md border border-[#cbd1c0] bg-white p-0.5">
           {(["preview", "code"] as const).map((candidate) => (
-            <IconTooltip key={candidate} align="left" label={candidate === "preview" ? "预览" : "查看源码"}>
+            <IconTooltip key={candidate} align="left" label={candidate === "preview" ? pv.tabPreview : pv.tabCode}>
               <button
                 type="button"
                 onClick={() => setView(candidate)}
-                aria-label={candidate === "preview" ? "预览" : "查看源码"}
+                aria-label={candidate === "preview" ? pv.tabPreview : pv.tabCode}
                 aria-pressed={view === candidate}
                 className={`flex h-10 w-10 items-center justify-center rounded ${
                   view === candidate ? "bg-[var(--brand-ink)] text-white" : "text-[var(--brand-muted)] hover:bg-[#eff5d9]"
@@ -530,11 +558,11 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
           <>
             <div className="ml-auto" />
             {status === "ready" && (
-              <IconTooltip label="停止开发服务器（保留 WebContainer）">
+              <IconTooltip label={pv.actionStopHint}>
                 <button
                   type="button"
                   onClick={stop}
-                  aria-label="停止服务"
+                  aria-label={pv.actionStop}
                   className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-red-300 text-red-600 hover:bg-red-50"
                 >
                   <svg viewBox="0 0 24 24" fill="currentColor" className="h-4 w-4" aria-hidden="true">
@@ -543,12 +571,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
                 </button>
               </IconTooltip>
             )}
-            <IconTooltip label={status === "stopped" ? "启动服务" : "刷新：重新挂载工作区并重启开发服务器"}>
+            <IconTooltip label={status === "stopped" ? pv.actionStart : pv.actionRefreshHint}>
               <button
                 type="button"
                 onClick={refresh}
                 disabled={status !== "ready" && status !== "error" && status !== "stopped"}
-                aria-label={status === "stopped" ? "启动服务" : "重新启动"}
+                aria-label={status === "stopped" ? pv.actionStart : pv.actionRefresh}
                 className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:pointer-events-none disabled:opacity-40"
               >
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
@@ -556,11 +584,11 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
                 </svg>
               </button>
             </IconTooltip>
-            <IconTooltip label={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}>
+            <IconTooltip label={consoleSize === "hidden" ? pv.actionShowTerminal : pv.actionHideTerminal}>
               <button
                 type="button"
                 onClick={() => setConsoleSize((size) => size === "hidden" ? "compact" : "hidden")}
-                aria-label={consoleSize === "hidden" ? "显示终端" : "隐藏终端"}
+                aria-label={consoleSize === "hidden" ? pv.actionShowTerminal : pv.actionHideTerminal}
                 aria-expanded={consoleSize !== "hidden"}
                 aria-controls="preview-console"
                 className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-[#cbd1c0] bg-white text-[var(--brand-ink)] hover:bg-[#eff5d9]"
@@ -579,8 +607,8 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
         </div>
       )}
       <div className={view === "preview" ? "relative min-h-0 flex-1" : "hidden"}>
-        {previewUrl ? <iframe ref={iframeRef} src={previewUrl} onLoad={onPreviewLoad} title="WebContainer 应用预览" className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
-          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error}</p><p className="max-w-md px-4 text-center text-[13px] text-neutral-500">请查看下方终端输出，确认工作区服务正常后重新启动。</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[13px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">开发服务器已停止</p><p className="text-[13px] text-neutral-400">点击“启动服务”即可继续运行，容器和已安装的依赖仍然保留。</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-[var(--brand-purple)]" /><p className="text-sm">{statusLabel[status]}</p><p className="text-[13px] text-neutral-400">正在通过快照加载工作区到本机电脑（第一次可能较慢）。</p></>}
+        {previewUrl ? <iframe ref={iframeRef} src={previewUrl} onLoad={onPreviewLoad} title={pv.iframeTitle} className="h-full w-full bg-white" allow="popups; popups-to-escape-sandbox; scripts; same-origin" referrerPolicy="no-referrer" /> : <div className="flex h-full flex-col items-center justify-center gap-3 text-neutral-500">
+          {status === "error" ? <><p className="max-w-md px-4 text-center text-sm font-medium text-red-600">{error ? renderPreviewError(pv, error) : pv.statusError}</p><p className="max-w-md px-4 text-center text-[13px] text-neutral-500">{pv.errorCheckTerminal}</p>{logs.length > 0 && <pre className="max-h-40 max-w-xl overflow-auto rounded bg-neutral-100 p-3 text-left text-[13px] text-neutral-700">{logs.join("")}</pre>}</> : status === "stopped" ? <><p className="text-sm font-medium text-neutral-600">{pv.stoppedTitle}</p><p className="text-[13px] text-neutral-400">{pv.stoppedBody}</p></> : <><div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-[var(--brand-purple)]" /><p className="text-sm">{statusLabel[status]}</p><p className="text-[13px] text-neutral-400">{pv.loadingHint}</p></>}
         </div>}
       </div>
 
@@ -596,12 +624,12 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
       >
         <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--brand-line)] bg-[#f0f2e9] px-3">
           <span className="text-[#799b39]" aria-hidden="true">●</span>
-          <span className="text-[13px] font-bold text-[var(--brand-ink)]">终端</span>
-          <IconTooltip className="ml-auto" label={consoleSize === "expanded" ? "收起终端" : "展开终端"}>
+          <span className="text-[13px] font-bold text-[var(--brand-ink)]">{pv.terminalTitle}</span>
+          <IconTooltip className="ml-auto" label={consoleSize === "expanded" ? pv.actionCollapseTerminal : pv.actionExpandTerminal}>
             <button
               type="button"
               onClick={() => setConsoleSize((size) => size === "expanded" ? "compact" : "expanded")}
-              aria-label={consoleSize === "expanded" ? "收起终端" : "展开终端"}
+              aria-label={consoleSize === "expanded" ? pv.actionCollapseTerminal : pv.actionExpandTerminal}
               className="flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
@@ -609,11 +637,11 @@ export default function WebContainerPreview({ workspaceId: workspaceIdProp }: Pr
               </svg>
             </button>
           </IconTooltip>
-          <IconTooltip label="隐藏终端">
+          <IconTooltip label={pv.actionHideTerminal}>
             <button
               type="button"
               onClick={() => setConsoleSize("hidden")}
-              aria-label="隐藏终端"
+              aria-label={pv.actionHideTerminal}
               className="flex h-8 w-8 items-center justify-center rounded text-[var(--brand-muted)] hover:bg-[#e1e7d4]"
             >
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" className="h-4 w-4" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>

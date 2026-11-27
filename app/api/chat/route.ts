@@ -15,9 +15,9 @@ export async function POST(request: Request) {
     if (typeof body?.workspaceId !== "string") throw new Error("缺少工作区");
     workspaceId = body.workspaceId;
   } catch {
-    return errorResponse(400, "WORKSPACE_REQUIRED", "必须提供 workspaceId。");
+    return errorResponse(400, "WORKSPACE_REQUIRED", "必须提供 workspaceId。", { messageKey: "request.workspaceIdRequired" });
   }
   const access = await requireOwnedWorkspace(workspaceId, request);
   if (!access.ok) return access.response;
-  return errorResponse(410, "LEGACY_CHAT_DISABLED", "请使用工作区智能助手的消息和事件接口。");
+  return errorResponse(410, "LEGACY_CHAT_DISABLED", "请使用工作区智能助手的消息和事件接口。", { messageKey: "request.legacyChatDisabled" });
 }

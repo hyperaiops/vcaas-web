@@ -5,6 +5,7 @@ import { authConfig, cookieOptions, SESSION_COOKIE, TRANSACTION_COOKIE } from "@
 import { oidcClient } from "@/app/lib/auth/oidc";
 import { oidcDiagnostic, oidcFailureHint } from "@/app/lib/auth/diagnostics";
 import { consumeLogin, createSession, revokeSession } from "@/app/lib/auth/store";
+import { formatApiMessage, type ApiMessageArgs, type ApiMessageKey } from "@/app/lib/i18n/api-messages";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -58,14 +59,22 @@ export async function GET(request: Request) {
     const diagnostic = oidcDiagnostic(error);
     console.warn("[auth/callback] Sign-in rejected", { stage, code, ...diagnostic });
     const hint = oidcFailureHint(diagnostic) ?? (code === "LOGIN_COOKIE_MISSING"
-      ? "未找到登录凭据。请从网站首页重新登录，并始终使用配置的认证域名，不要混用其他域名或 IP 地址。"
+      ? { text: formatApiMessage("auth.hintCookieMissing"), messageKey: "auth.hintCookieMissing" as ApiMessageKey }
       : code === "LOGIN_TRANSACTION_EXPIRED"
-        ? "本次登录已过期或回调链接已被使用，请从网站首页重新登录。"
-        : "请重新登录。如仍然失败，请仅将下方错误编号提供给管理员，不要发送带授权码的完整地址。");
+        ? { text: formatApiMessage("auth.hintTransactionExpired"), messageKey: "auth.hintTransactionExpired" as ApiMessageKey }
+        : { text: formatApiMessage("auth.hintGeneric"), messageKey: "auth.hintGeneric" as ApiMessageKey });
     const detail = diagnostic.reason === "UNCLASSIFIED" ? "" : `/${diagnostic.reason}`;
-    response = new NextResponse(`登录失败或已过期。\n${hint}\n错误编号：${stage}/${code}${detail}\n重新登录：/auth/login`, {
+    // Stable localization metadata for clients; the plain-text body and status
+    // stay unchanged. Args only ever contain allowlisted algorithm names.
+    const hintArgs: ApiMessageArgs = hint.args ?? {};
+    response = new NextResponse(`登录失败或已过期。\n${hint.text}\n错误编号：${stage}/${code}${detail}\n重新登录：/auth/login`, {
       status: 400,
-      headers: { "x-auth-error": code, "x-auth-reason": diagnostic.reason },
+      headers: {
+        "x-auth-error": code,
+        "x-auth-reason": diagnostic.reason,
+        "x-auth-message-key": hint.messageKey,
+        ...(Object.keys(hintArgs).length ? { "x-auth-message-args": JSON.stringify(hintArgs) } : {}),
+      },
     });
   }
   response.cookies.set(TRANSACTION_COOKIE, "", { ...cookieOptions, maxAge: 0 });

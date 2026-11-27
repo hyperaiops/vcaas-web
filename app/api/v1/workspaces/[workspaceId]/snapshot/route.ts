@@ -39,7 +39,7 @@ export async function GET(request: Request, { params }: Context) {
 
   const snapshot = await findSnapshot(tree.revision);
   if (!snapshot) {
-    return errorResponse(404, "SNAPSHOT_NOT_AVAILABLE", "当前工作区暂无可用快照。");
+    return errorResponse(404, "SNAPSHOT_NOT_AVAILABLE", "当前工作区暂无可用快照。", { messageKey: "snapshot.notAvailable" });
   }
   if (request.headers.get("if-none-match") === quoteETag(snapshot.sha256)) {
     return new Response(null, { status: 304, headers: { etag: quoteETag(snapshot.sha256), "cache-control": "private, no-store" } });
@@ -69,9 +69,9 @@ export async function POST(request: Request, { params }: Context) {
           contents = await generateSnapshot(tree);
         } catch (error) {
           if (error instanceof SnapshotTooLargeError) {
-            return errorResponse(413, "SNAPSHOT_TOO_LARGE", "生成的快照超过大小上限。");
+            return errorResponse(413, "SNAPSHOT_TOO_LARGE", "生成的快照超过大小上限。", { messageKey: "snapshot.tooLarge" });
           }
-          return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "无法生成工作区快照。");
+          return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "无法生成工作区快照。", { messageKey: "snapshot.generationFailed" });
         }
 
         // Re-build to detect a change during generation; if the revision
@@ -86,16 +86,16 @@ export async function POST(request: Request, { params }: Context) {
           headers: snapshotHeaders(workspace.id, tree.revision, sha256, contents.byteLength, "no-store"),
         });
       }
-      return errorResponse(409, "WORKSPACE_CHANGED_DURING_SNAPSHOT", "生成快照期间工作区多次发生变更，请重试。");
+      return errorResponse(409, "WORKSPACE_CHANGED_DURING_SNAPSHOT", "生成快照期间工作区多次发生变更，请重试。", { messageKey: "snapshot.workspaceChanged" });
     });
     return result;
   } catch (error) {
     if (error instanceof GenerationInProgressError) {
       return new Response(
-        JSON.stringify({ error: { code: "SNAPSHOT_GENERATION_IN_PROGRESS", message: error.message } }),
+        JSON.stringify({ error: { code: "SNAPSHOT_GENERATION_IN_PROGRESS", message: error.message, messageKey: "snapshot.generationInProgress" } }),
         { status: 409, headers: { "content-type": "application/json", "retry-after": "1" } },
       );
     }
-    return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "无法生成工作区快照。");
+    return errorResponse(500, "SNAPSHOT_GENERATION_FAILED", "无法生成工作区快照。", { messageKey: "snapshot.generationFailed" });
   }
 }

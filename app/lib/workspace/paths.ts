@@ -7,6 +7,7 @@
 import "server-only";
 import path from "node:path";
 import fs from "node:fs/promises";
+import type { ApiMessageArgs, ApiMessageKey } from "@/app/lib/i18n/api-messages";
 
 const IGNORED_NAMES = new Set([
   ".git",
@@ -37,10 +38,16 @@ export function isIgnoredName(name: string): boolean {
 
 export class WorkspacePathError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  messageKey?: ApiMessageKey;
+  args?: ApiMessageArgs;
+  constructor(code: string, message: string, localization?: { messageKey: ApiMessageKey; args?: ApiMessageArgs }) {
     super(message);
     this.code = code;
     this.name = "WorkspacePathError";
+    if (localization) {
+      this.messageKey = localization.messageKey;
+      this.args = localization.args;
+    }
   }
 }
 
@@ -54,20 +61,23 @@ export async function resolveSafeFilePath(
   segments: string[],
 ): Promise<string> {
   if (!segments.length) {
-    throw new WorkspacePathError("INVALID_PATH", "必须提供文件路径。");
+    throw new WorkspacePathError("INVALID_PATH", "必须提供文件路径。", { messageKey: "path.required" });
   }
 
   // Reject unsafe segments BEFORE joining so encoded separators (`%2f`) that
   // decode into a single segment can't sneak a traversal past the join.
   for (const segment of segments) {
     if (segment === "" || segment === "." || segment === "..") {
-      throw new WorkspacePathError("INVALID_PATH", "路径片段不能为空，也不能是“.”或“..”。");
+      throw new WorkspacePathError("INVALID_PATH", "路径片段不能为空，也不能是“.”或“..”。", { messageKey: "path.emptySegment" });
     }
     if (segment.includes("/") || segment.includes("\\") || segment.includes("\0")) {
-      throw new WorkspacePathError("INVALID_PATH", "路径片段不能包含路径分隔符。");
+      throw new WorkspacePathError("INVALID_PATH", "路径片段不能包含路径分隔符。", { messageKey: "path.separatorInSegment" });
     }
     if (isIgnoredName(segment)) {
-      throw new WorkspacePathError("PATH_IGNORED", `不允许写入“${segment}”。`);
+      throw new WorkspacePathError("PATH_IGNORED", `不允许写入“${segment}”。`, {
+        messageKey: "path.ignoredName",
+        args: { segment },
+      });
     }
   }
 
@@ -75,7 +85,7 @@ export async function resolveSafeFilePath(
   // Must stay within rootPath.
   const rootWithSep = rootPath.endsWith(path.sep) ? rootPath : rootPath + path.sep;
   if (resolved !== rootPath && !resolved.startsWith(rootWithSep)) {
-    throw new WorkspacePathError("PATH_OUTSIDE_WORKSPACE", "该路径超出了工作区范围。");
+    throw new WorkspacePathError("PATH_OUTSIDE_WORKSPACE", "该路径超出了工作区范围。", { messageKey: "path.outsideWorkspace" });
   }
 
   let current = rootPath;
@@ -86,16 +96,16 @@ export async function resolveSafeFilePath(
       info = await fs.lstat(current);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
-      throw new WorkspacePathError("INVALID_PATH", "无法检查目标路径。");
+      throw new WorkspacePathError("INVALID_PATH", "无法检查目标路径。", { messageKey: "path.uncheckable" });
     }
     if (info.isSymbolicLink()) {
-      throw new WorkspacePathError("PATH_UNSAFE", "不允许写入符号链接。");
+      throw new WorkspacePathError("PATH_UNSAFE", "不允许写入符号链接。", { messageKey: "path.symlink" });
     }
     if (i < segments.length - 1 && !info.isDirectory()) {
-      throw new WorkspacePathError("INVALID_PATH", "文件路径的父级必须是目录。");
+      throw new WorkspacePathError("INVALID_PATH", "文件路径的父级必须是目录。", { messageKey: "path.parentNotDirectory" });
     }
     if (i === segments.length - 1 && info.isDirectory()) {
-      throw new WorkspacePathError("PATH_IS_DIRECTORY", "该路径是一个目录。");
+      throw new WorkspacePathError("PATH_IS_DIRECTORY", "该路径是一个目录。", { messageKey: "path.isDirectory" });
     }
   }
   return resolved;

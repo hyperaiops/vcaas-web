@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, loader as monacoLoader } from "@monaco-editor/react";
 import { authenticatedFetch } from "@/app/lib/auth/client";
+import { useMessages } from "@/app/lib/i18n/context";
 import type { TreeNode } from "@/app/lib/workspace/types";
 
 // The generated AMD assets include the matching official Chinese language pack.
@@ -28,19 +29,19 @@ function ensureMonacoConfigured(): Promise<void> {
       monacoLoader.config(config);
       let timeoutId: number | undefined;
       const monaco = await new Promise<Monaco>((resolve, reject) => {
-        timeoutId = window.setTimeout(() => reject(new Error("本地编辑器加载超时")), 15000);
+        timeoutId = window.setTimeout(() => reject(new Error("local editor load timed out")), 15000);
         const loadScript = (src: string) => new Promise<void>((loaded, failed) => {
           const script = document.createElement("script");
           script.src = src;
           script.onload = () => loaded();
-          script.onerror = () => failed(new Error(`无法加载本地编辑器资源：${src}`));
+          script.onerror = () => failed(new Error(`failed to load local editor asset: ${src}`));
           document.body.appendChild(script);
         });
         void (async () => {
           await loadScript("/monaco/vs/loader.js");
           await loadScript("/monaco/vs/nls/lang/zh-cn.js");
           if (amd._VSCODE_NLS_LANGUAGE !== "zh-cn" || !Array.isArray(amd._VSCODE_NLS_MESSAGES) || amd._VSCODE_NLS_MESSAGES.length === 0) {
-            throw new Error("本地编辑器中文语言包未正确加载");
+            throw new Error("local editor zh-cn language pack did not load correctly");
           }
           // Monaco 0.56's language script installs globals but has no AMD define.
           // Its NLS plugin waits on require(["vs/nls/lang/zh-cn"]), so HTTP 200
@@ -189,13 +190,18 @@ function FileTreeItem({
   );
 }
 
+type CodeEditorKey = keyof import("@/app/lib/i18n/messages").Messages["codeEditor"];
+
 export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
+  const i18n = useMessages();
+  const ce = i18n.codeEditor;
   const [treeView, setTreeView] = useState<TreeNodeView[]>([]);
   const [files, setFiles] = useState<Map<string, FileEntry>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [editorStatus, setEditorStatus] = useState<"loading" | "ready" | "error">("loading");
-  const [error, setError] = useState<string | null>(null);
+  // Stable catalog key (null = none) so locale switches re-render the banner.
+  const [error, setError] = useState<CodeEditorKey | null>(null);
   const [saveState, setSaveState] = useState<SaveState>("idle");
   // Live (possibly unsaved) content for the active file, keyed by path.
   const [draftByPath, setDraftByPath] = useState<Record<string, string>>({});
@@ -204,7 +210,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
   const refreshTree = useCallback(async () => {
     try {
       const res = await authenticatedFetch(`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/tree`, { cache: "no-store" });
-      if (!res.ok) throw new Error(`请求失败（${res.status}）`);
+      if (!res.ok) throw new Error(`tree request failed (${res.status})`);
       const data = (await res.json()) as { root: TreeNode };
       const flat = new Map<string, FileEntry>();
       flattenTree(data.root, "", flat);
@@ -222,7 +228,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
       return flat;
     } catch (err) {
       console.error("File load failed", err);
-      setError("文件加载失败，请稍后重试。");
+      setError("loadFailed");
       return null;
     } finally {
       setLoading(false);
@@ -273,7 +279,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
           body: JSON.stringify({ contents }),
         });
         if (!res.ok) {
-          throw new Error(`请求失败（${res.status}）`);
+          throw new Error(`write request failed (${res.status})`);
         }
         // Mark the on-disk contents as the new baseline so the file is no longer dirty.
         setFiles((prev) => {
@@ -292,7 +298,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
       } catch (err) {
         setSaveState("error");
         console.error("File save failed", err);
-        setError("保存失败，请稍后重试。");
+        setError("saveFailed");
       }
     },
     [workspaceId],
@@ -325,17 +331,17 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
     () => ({
       fontSize: 14,
       fontFamily: 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, "PingFang SC", "Microsoft YaHei", "Noto Sans Mono CJK SC", monospace',
-      ariaLabel: "代码编辑器",
+      ariaLabel: ce.ariaLabel,
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
       automaticLayout: true,
       tabSize: 2,
       wordWrap: "on" as const,
     }),
-    [],
+    [ce.ariaLabel],
   );
 
-  const saveLabel: Record<SaveState, string> = { idle: "", saving: "正在保存…", saved: "已保存", error: "保存失败" };
+  const saveLabel: Record<SaveState, string> = { idle: "", saving: ce.saveSaving, saved: ce.saveSaved, error: ce.saveError };
   const saveColor: Record<SaveState, string> = {
     idle: "text-neutral-400",
     saving: "text-amber-500",
@@ -347,33 +353,33 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
     <div className="flex h-full flex-col bg-white">
       {/* Editor toolbar */}
       <div className="flex min-h-10 shrink-0 items-center gap-2 border-b border-[var(--brand-line)] bg-[#f0f2e9] px-3">
-        <span className="text-[13px] font-bold text-[var(--brand-ink)]">代码</span>
+        <span className="text-[13px] font-bold text-[var(--brand-ink)]">{ce.title}</span>
         <span className="min-w-0 max-w-[16rem] flex-1 truncate font-mono text-[13px] text-[var(--brand-muted)]" title={activePath ?? ""}>
-          {activePath ?? "未选择文件"}
+          {activePath ?? ce.noFileSelected}
         </span>
-        {isDirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title="有未保存的更改" />}
+        {isDirty && <span className="h-1.5 w-1.5 rounded-full bg-amber-400" title={ce.unsavedChanges} />}
         <span className={`text-[13px] ${saveColor[saveState]}`}>{saveLabel[saveState]}</span>
         <button
           type="button"
           onClick={() => void refreshTree()}
           className="ml-auto min-h-8 shrink-0 rounded-md border border-[#cbd1c0] bg-white px-2.5 py-1 text-[13px] text-[var(--brand-ink)] hover:bg-[#eff5d9]"
-          title="重新读取磁盘中的文件"
+          title={ce.refreshHint}
         >
-          刷新文件
+          {ce.refresh}
         </button>
       </div>
 
       {error && (
-        <p className="shrink-0 border-b border-red-200 bg-red-50 px-3 py-1.5 text-[13px] text-red-600">{error}</p>
+        <p className="shrink-0 border-b border-red-200 bg-red-50 px-3 py-1.5 text-[13px] text-red-600">{ce[error] as string}</p>
       )}
 
       <div className="flex min-h-0 flex-1">
         {/* File tree */}
         <aside className="w-36 shrink-0 overflow-y-auto border-r border-[var(--brand-line)] bg-[#fafbf5] py-2 sm:w-52">
           {loading ? (
-            <p className="px-3 py-2 text-[13px] text-neutral-400">正在加载…</p>
+            <p className="px-3 py-2 text-[13px] text-neutral-400">{ce.loading}</p>
           ) : treeView.length === 0 ? (
-            <p className="px-3 py-2 text-[13px] text-neutral-400">暂无文件。</p>
+            <p className="px-3 py-2 text-[13px] text-neutral-400">{ce.empty}</p>
           ) : (
             treeView.map((node) => (
               <FileTreeItem key={node.path} node={node} depth={0} activePath={activePath} onSelect={setActivePath} />
@@ -385,24 +391,27 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
         <div className="min-w-0 flex-1">
           {editorStatus === "error" ? (
             <div role="alert" className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center text-sm text-neutral-600">
-              <p>代码编辑器加载失败，请检查网络连接后重试。</p>
+              <p>{ce.errorTitle}</p>
               {/* The upstream loader retains a rejected initialization promise.
                   Reloading resets it without relying on private loader state. */}
               <button type="button" onClick={() => window.location.reload()} className="rounded border border-neutral-300 px-3 py-1.5 hover:bg-neutral-100">
-                重新加载页面并重试
+                {ce.errorReload}
               </button>
             </div>
           ) : editorStatus === "loading" ? (
-            <div className="flex h-full items-center justify-center text-sm text-neutral-400">正在加载编辑器…</div>
+            <div className="flex h-full items-center justify-center text-sm text-neutral-400">{ce.loadingMonaco}</div>
           ) : !activeFile ? (
-            <div className="flex h-full items-center justify-center text-sm text-neutral-400">
-              选择一个文件开始编辑。
+            <div className="flex h-full flex-col items-center justify-center gap-1 text-sm text-neutral-400">
+              <p>{ce.selectFile}</p>
+              {/* Monaco's UI language is fixed at first load (zh-cn pack); say so
+                  explicitly instead of silently ignoring the page locale. */}
+              <p className="px-4 text-center text-[13px] text-neutral-300">{ce.monacoLocaleHint}</p>
             </div>
           ) : isBinary ? (
             <div className="flex h-full items-center justify-center text-sm text-neutral-400">
               <div className="text-center">
-                <p className="font-medium text-neutral-500">二进制文件</p>
-                <p className="mt-1 text-[13px]">代码编辑器暂不支持编辑此类文件。</p>
+                <p className="font-medium text-neutral-500">{ce.binaryTitle}</p>
+                <p className="mt-1 text-[13px]">{ce.binaryBody}</p>
               </div>
             </div>
           ) : (
@@ -412,7 +421,7 @@ export default function CodeEditor({ workspaceId }: { workspaceId: string }) {
               value={activeDraft}
               onChange={handleChange}
               options={monacoOptions}
-              loading={<div className="flex h-full items-center justify-center text-sm text-neutral-400">正在加载编辑器…</div>}
+              loading={<div className="flex h-full items-center justify-center text-sm text-neutral-400">{ce.loadingMonaco}</div>}
             />
           )}
         </div>

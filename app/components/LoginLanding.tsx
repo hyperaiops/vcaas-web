@@ -1,4 +1,8 @@
+"use client";
+
 import styles from "./LoginLanding.module.css";
+import LanguageSwitcher from "./LanguageSwitcher";
+import { useMessages } from "@/app/lib/i18n/context";
 
 function Arrow({ diagonal = false }: { diagonal?: boolean }) {
   return (
@@ -8,126 +12,135 @@ function Arrow({ diagonal = false }: { diagonal?: boolean }) {
   );
 }
 
-function qqGroupUrl(): string | null {
-  const value = process.env.COMMERCIAL_QQ_GROUP_URL;
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" && ["qm.qq.com", "jq.qq.com"].includes(url.hostname) && !url.username && !url.password && !url.port
-      ? url.href : null;
-  } catch {
-    return null;
-  }
-}
+export default function LoginLanding({ groupUrl = null }: { groupUrl?: string | null }) {
+  const m = useMessages();
+  const L = m.loginLanding;
 
-export default function LoginLanding() {
-  const groupUrl = qqGroupUrl();
+  // The landing page scrolls inside `.landing` (body is overflow-hidden), so
+  // the browser's default fragment scrolling does not reach these sections.
+  // Scroll the container explicitly and keep the URL hash in sync.
+  const scrollToId = (id: string) => (event: React.MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault();
+    const target = document.getElementById(id);
+    const container = event.currentTarget.closest(`.${styles.landing}`);
+    if (container instanceof HTMLElement && target) {
+      const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+      container.scrollTo({ top, behavior: "smooth" });
+    } else {
+      target?.scrollIntoView({ behavior: "smooth" });
+    }
+    window.history.replaceState(null, "", `#${id}`);
+  };
+
   return (
     <main className={styles.landing}>
       <div className={styles.shell}>
-        <header className={styles.header}>
-          <div className={styles.brand} aria-label="随心一码">
+        <header className={styles.header} id="top">
+          <a className={styles.brand} aria-label={m.common.brandName} href="#top" onClick={scrollToId("top")}>
             <span className={styles.brandMark} aria-hidden="true">{'</>'}</span>
-            <span>随心一码<span className={styles.brandDot}>.</span></span>
+            <span>{m.common.brandName}<span className={styles.brandDot}>.</span></span>
+          </a>
+          <div className="flex items-center gap-3">
+            <nav className={styles.nav} aria-label={L.homeNav}>
+              <a className={styles.aboutLink} href="#how-it-works" onClick={scrollToId("how-it-works")}>{L.howItWorks}</a>
+              <a className={styles.aboutLink} href="#plans" onClick={scrollToId("plans")}>{L.plans}</a>
+              <a className={styles.navLogin} href="/auth/login">{L.loginCta} <Arrow diagonal /></a>
+            </nav>
+            <LanguageSwitcher />
           </div>
-          <nav className={styles.nav} aria-label="首页导航">
-            <a className={styles.aboutLink} href="#how-it-works">怎么玩</a>
-            <a className={styles.aboutLink} href="#plans">套餐介绍</a>
-            <a className={styles.navLogin} href="/auth/login">登录 / 开始创作 <Arrow diagonal /></a>
-          </nav>
         </header>
 
         <section className={styles.hero} aria-labelledby="landing-title">
           <div className={styles.heroCopy}>
-            <div className={styles.eyebrow}><span /> Token 永久免费 · 和 AI 一起编程创作</div>
+            <div className={styles.eyebrow}><span /> {L.eyebrow}</div>
             <h1 id="landing-title" className={styles.title}>
-              今天你<br />
-              <span className={styles.vibe}>vibe<svg viewBox="0 0 300 18" preserveAspectRatio="none" aria-hidden="true"><path d="M3 13C68 1 186 2 295 8M24 16C113 7 224 7 280 12" /></svg></span> 了吗<span className={styles.question}>？</span>
+              {L.titleToday}<br />
+              <span className={styles.vibe}>vibe<svg viewBox="0 0 300 18" preserveAspectRatio="none" aria-hidden="true"><path d="M3 13C68 1 186 2 295 8M24 16C113 7 224 7 280 12" /></svg></span> {L.titleVibed}<span className={styles.question}>{L.titleQuestion}</span>
             </h1>
-            <p className={styles.subtitle}><strong>免费使用，</strong>随心创造。</p>
-            <p className={styles.description}>平台 Token 永久免费，和 AI 聊天编程。<br className={styles.desktopBreak} />把你的想法和创意，变成真正能用的网页、工具和应用。</p>
+            <p className={styles.subtitle}><strong>{L.subtitleFree}</strong>{L.subtitleCreate}</p>
+            <p className={styles.description}>{L.description}</p>
             <div className={styles.heroActions}>
-              <a className={styles.primaryButton} href="/auth/login">免费登录，开始创造 <Arrow /></a>
-              <span className={styles.loginHint}>无需安装 · 不必先会代码 · 聊天就能开始</span>
+              <a className={styles.primaryButton} href="/auth/login">{L.primaryCta} <Arrow /></a>
+              <span className={styles.loginHint}>{L.loginHint}</span>
             </div>
             <div className={styles.rewardTeaser}>
               <span className={styles.playIcon} aria-hidden="true">▶</span>
-              <span>Token 永久免费 <span className={styles.smallArrow}>·</span> 广告支持运营</span>
-              <span className={styles.policyBadge}>专注你的创意</span>
+              <span>{L.rewardTeaser}</span>
+              <span className={styles.policyBadge}>{L.policyBadge}</span>
             </div>
           </div>
 
-          <div className={styles.heroVisual} aria-label="用自然语言创建应用的产品示意">
+          <div className={styles.heroVisual} aria-label={L.visualAriaLabel}>
             <div className={styles.visualHeading}>
-              <div className={styles.freeSticker}>用灵感开场<span>不必先会写代码</span></div>
+              <div className={styles.freeSticker}>{L.freeSticker}<span>{L.freeStickerSub}</span></div>
               <div className={styles.orbitLabel} aria-hidden="true">Less overthinking.<br /><strong>More creating.</strong></div>
             </div>
             <div className={styles.productWindow}>
               <div className={styles.windowBar}>
                 <div className={styles.windowDots} aria-hidden="true"><i /><i /><i /></div>
-                <span>我的第一个创意 / 随心一码</span>
-                <span className={styles.demoLabel}>体验示意</span>
+                <span>{L.windowTitle}</span>
+                <span className={styles.demoLabel}>{L.demoLabel}</span>
               </div>
               <div className={styles.productBody}>
-                <div className={styles.promptBubble}>帮我做一个，<br /><strong>记录生活小美好的网页。</strong><span>↵</span></div>
-                <div className={styles.agentReply}><span className={styles.miniMark} aria-hidden="true">✳</span><div>好想法。我们把它变成真的。<div className={styles.codeLines} aria-hidden="true"><span /><span /><span /></div></div></div>
+                <div className={styles.promptBubble}>{L.promptBubble}<span>↵</span></div>
+                <div className={styles.agentReply}><span className={styles.miniMark} aria-hidden="true">✳</span><div>{L.agentReply}<div className={styles.codeLines} aria-hidden="true"><span /><span /><span /></div></div></div>
                 <div className={styles.previewCard}>
-                  <div className={styles.previewNav}><span>小美好<span>®</span></span><span>生活值得被记录 ↗</span></div>
+                  <div className={styles.previewNav}><span>{L.previewNavBrand}<span>®</span></span><span>{L.previewNavSlogan}</span></div>
                   <div className={styles.previewContent}>
-                    <span className={styles.previewTag}>收藏生活里的每一份美好</span>
-                    <p>把普通日子，<br /><span>过成小小收藏。</span></p>
-                    <div className={styles.previewChips}><span>☀ 一点阳光</span><span>♫ 一首好歌</span><span>♡ 一件小事</span></div>
+                    <span className={styles.previewTag}>{L.previewTag}</span>
+                    <p>{L.previewLine1}<br /><span>{L.previewLine2}</span></p>
+                    <div className={styles.previewChips}><span>{L.chip1}</span><span>{L.chip2}</span><span>{L.chip3}</span></div>
                   </div>
                   <div className={styles.previewFlower} aria-hidden="true">✳</div>
                 </div>
-                <div className={styles.productFooter}><span><i /> 从一句话，到一个作品</span><span>你的想法，正在发生 ↗</span></div>
+                <div className={styles.productFooter}><span><i /> {L.productFooterLeft}</span><span>{L.productFooterRight}</span></div>
               </div>
             </div>
-            <div className={styles.ideaSticker} aria-hidden="true"><span>你好，</span><strong>我的新作品！</strong><svg viewBox="0 0 70 40"><path d="M5 6c6 25 40 32 58 10m-14-2 15 1-1 15" /></svg></div>
+            <div className={styles.ideaSticker} aria-hidden="true"><span>{L.ideaStickerHello}</span><strong>{L.ideaStickerWork}</strong><svg viewBox="0 0 70 40"><path d="M5 6c6 25 40 32 58 10m-14-2 15 1-1 15" /></svg></div>
           </div>
         </section>
 
         <section id="how-it-works" className={styles.howItWorks} aria-labelledby="how-title">
-          <div className={styles.sectionIntro}><span className={styles.sectionLabel}>你的想法，就是下一个作品。</span><h2 id="how-title">别等准备好，<br />先把第一步写出来。</h2></div>
+          <div className={styles.sectionIntro}><span className={styles.sectionLabel}>{L.howSectionLabel}</span><h2 id="how-title">{L.howTitleLine1}<br />{L.howTitleLine2}</h2></div>
           <ol className={styles.steps}>
-            <li><span className={styles.stepNumber}>01 /</span><h3>免费登录，带上创意</h3><p>网站免费使用，不必先会编程。<br />有一句「我想做一个……」就能开始。</p></li>
-            <li><span className={styles.stepNumber}>02 /</span><h3>和 AI 聊天，实现想法</h3><p>用自己的话描述需求，边聊边改。<br />一起做出你的网页、工具和应用。</p></li>
-            <li><span className={styles.stepNumber}>03 /</span><h3>Token 永久免费</h3><p>平台不售卖 Token，仅通过广告支持运营。<br />让你的每一个创意，都能免费开始。</p></li>
+            <li><span className={styles.stepNumber}>01 /</span><h3>{L.step1Title}</h3><p>{L.step1Body}</p></li>
+            <li><span className={styles.stepNumber}>02 /</span><h3>{L.step2Title}</h3><p>{L.step2Body}</p></li>
+            <li><span className={styles.stepNumber}>03 /</span><h3>{L.step3Title}</h3><p>{L.step3Body}</p></li>
           </ol>
         </section>
 
         <section id="plans" className={styles.plans} aria-labelledby="plans-title">
           <div className={styles.plansIntro}>
             <div>
-              <span className={styles.sectionLabel}>找到适合你的创作方式</span>
-              <h2 id="plans-title">好点子，都值得开始<span>.</span></h2>
+              <span className={styles.sectionLabel}>{L.plansSectionLabel}</span>
+              <h2 id="plans-title">{L.plansTitle}<span>.</span></h2>
             </div>
-            <p>个人创作还是商业需求？<br />选一种适合你的方式，和我们一起创造。</p>
+            <p>{L.plansIntro}</p>
           </div>
-          <div className={styles.plansTableWrap} role="region" aria-label="套餐对比表，可横向滚动" tabIndex={0}>
+          <div className={styles.plansTableWrap} role="region" aria-label={L.plansTableAria} tabIndex={0}>
             <table className={styles.plansTable}>
-              <caption className={styles.srOnly}>免费与商业用户方案比较</caption>
+              <caption className={styles.srOnly}>{L.plansTableCaption}</caption>
               <thead>
                 <tr>
-                  <th scope="col">方案</th>
-                  <th scope="col"><span className={styles.planBadge}>个人创作</span><strong>免费方案</strong></th>
-                  <th scope="col"><span className={styles.businessBadge}>商业用户</span><strong>商业咨询</strong></th>
+                  <th scope="col">{L.thPlan}</th>
+                  <th scope="col"><span className={styles.planBadge}>{L.personalBadge}</span><strong>{L.freePlan}</strong></th>
+                  <th scope="col"><span className={styles.businessBadge}>{L.businessBadge}</span><strong>{L.businessPlan}</strong></th>
                 </tr>
               </thead>
               <tbody>
-                <tr><th scope="row">适合谁</th><td>个人学习与创意探索</td><td>商业用户与团队</td></tr>
-                <tr><th scope="row">使用方式</th><td>平台 Token 永久免费，观看广告支持运营</td><td>通过 QQ 群或微信联系，咨询商业使用</td></tr>
-                <tr><th scope="row">部署方式</th><td>免费部署</td><td>私有部署</td></tr>
-                <tr><th scope="row">上线时长</th><td>最长 1 天，之后下线</td><td>根据需求咨询</td></tr>
-                <tr><th scope="row">备案支持</th><td>—</td><td>协助备案</td></tr>
+                <tr><th scope="row">{L.rowAudience}</th><td>{L.rowAudienceFree}</td><td>{L.rowAudienceBiz}</td></tr>
+                <tr><th scope="row">{L.rowUsage}</th><td>{L.rowUsageFree}</td><td>{L.rowUsageBiz}</td></tr>
+                <tr><th scope="row">{L.rowDeploy}</th><td>{L.rowDeployFree}</td><td>{L.rowDeployBiz}</td></tr>
+                <tr><th scope="row">{L.rowDuration}</th><td>{L.rowDurationFree}</td><td>{L.rowDurationBiz}</td></tr>
+                <tr><th scope="row">{L.rowFiling}</th><td>—</td><td>{L.rowFilingBiz}</td></tr>
                 <tr>
-                  <th scope="row">开始方式</th>
-                  <td><a className={styles.planLink} href="/auth/login">免费开始 <span aria-hidden="true">↗</span></a></td>
+                  <th scope="row">{L.rowStart}</th>
+                  <td><a className={styles.planLink} href="/auth/login">{L.startFree} <span aria-hidden="true">↗</span></a></td>
                   <td>
                     <div className={styles.contactDetails}>
-                      <span>QQ 群：1135649093</span>
-                      <span>微信：HyperDevOps</span>
-                      {groupUrl && <a className={styles.qqLink} href={groupUrl} target="_blank" rel="noopener noreferrer">加入 QQ 群 <span aria-hidden="true">↗</span></a>}
+                      <span>{L.qqGroupLabel}</span>
+                      <span>{L.wechatLabel}</span>
+                      {groupUrl && <a className={styles.qqLink} href={groupUrl} target="_blank" rel="noopener noreferrer">{L.joinQq} <span aria-hidden="true">↗</span></a>}
                     </div>
                   </td>
                 </tr>
@@ -137,9 +150,9 @@ export default function LoginLanding() {
         </section>
 
         <footer className={styles.footer}>
-          <span><strong>随心一码.</strong> 给每个「我有个想法」一个开始。</span>
-          <span className={styles.footerNote}>平台 Token 永久免费，仅通过广告支持运营。</span>
-          <a href="/auth/login">现在就 vibe 一下 <Arrow diagonal /></a>
+          <span><strong>{m.common.brandName}.</strong> {L.footerTagline}</span>
+          <span className={styles.footerNote}>{L.footerNote}</span>
+          <a href="/auth/login">{L.footerCta} <Arrow diagonal /></a>
         </footer>
       </div>
     </main>

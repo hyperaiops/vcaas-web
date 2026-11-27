@@ -16,6 +16,7 @@ import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Prisma, PrismaClient } from "@prisma/client";
 import { isValidWorkspaceId, type WorkspaceRow } from "./workspace/types";
+import type { ApiMessageArgs, ApiMessageKey } from "./i18n/api-messages";
 
 export type NewWorkspace = {
   id?: string;
@@ -120,14 +121,14 @@ export async function workspaceIdUsed(id: string): Promise<boolean> {
 export async function createWorkspace({ id, name, rootPath, ownerId }: NewWorkspace): Promise<WorkspaceRow> {
   const workspaceId = id ?? generateId(name);
   if (!isValidWorkspaceId(workspaceId)) {
-    throw new WorkspaceError("INVALID_WORKSPACE_ID", "工作区 ID 只能包含小写字母、数字和连字符。");
+    throw new WorkspaceError("INVALID_WORKSPACE_ID", "工作区 ID 只能包含小写字母、数字和连字符。", { messageKey: "workspace.invalidId" });
   }
   const db = await getPrisma();
   if (await workspaceIdUsed(workspaceId)) {
-    throw new WorkspaceError("WORKSPACE_EXISTS", "该 ID 的工作区已存在。");
+    throw new WorkspaceError("WORKSPACE_EXISTS", "该 ID 的工作区已存在。", { messageKey: "workspace.exists" });
   }
   if (await db.workspace.findUnique({ where: { rootPath }, select: { id: true } })) {
-    throw new WorkspaceError("WORKSPACE_EXISTS", "该目录已被其他工作区使用。");
+    throw new WorkspaceError("WORKSPACE_EXISTS", "该目录已被其他工作区使用。", { messageKey: "workspace.rootPathInUse" });
   }
   const now = new Date().toISOString();
   try {
@@ -140,7 +141,7 @@ export async function createWorkspace({ id, name, rootPath, ownerId }: NewWorksp
     });
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      throw new WorkspaceError("WORKSPACE_EXISTS", "该 ID 或目录的工作区已存在。");
+      throw new WorkspaceError("WORKSPACE_EXISTS", "该 ID 或目录的工作区已存在。", { messageKey: "workspace.idOrRootPathInUse" });
     }
     throw error;
   }
@@ -171,9 +172,15 @@ function generateId(name: string): string {
 
 export class WorkspaceError extends Error {
   code: string;
-  constructor(code: string, message: string) {
+  messageKey?: ApiMessageKey;
+  args?: ApiMessageArgs;
+  constructor(code: string, message: string, localization?: { messageKey: ApiMessageKey; args?: ApiMessageArgs }) {
     super(message);
     this.code = code;
     this.name = "WorkspaceError";
+    if (localization) {
+      this.messageKey = localization.messageKey;
+      this.args = localization.args;
+    }
   }
 }

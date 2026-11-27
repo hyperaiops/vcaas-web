@@ -20,11 +20,11 @@ export async function POST(_request: Request, { params }: Context) {
   const auth = await requireOwnedWorkspace(workspaceId, _request);
   if (!auth.ok) return auth.response;
   const lease = parseLease(await readAgentBody(_request));
-  if (!lease) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。");
+  if (!lease) return errorResponse(400, "INVALID_AGENT_LEASE", "请提供有效的页面租约。", { messageKey: "agent.invalidLease" });
   try {
     await ensureAgentSession(workspaceId, lease);
     return jsonResponse({ apiVersion: "v1", connected: true });
   } catch (error) {
-    return agentError(error, 503, "AGENT_START_FAILED", "无法启动工作区智能助手。");
+    return agentError(error, 503, "AGENT_START_FAILED", "无法启动工作区智能助手。", "agent.startFailed");
   }
 }

@@ -28,8 +28,12 @@ export async function resolveWorkspaceTree(
     return { ok: true, workspace, tree };
   } catch (error) {
     if (error instanceof WorkspaceTreeError) {
-      return { ok: false, response: errorResponse(422, error.code, error.message) };
+      return {
+        ok: false,
+        response: errorResponse(422, error.code, error.message,
+          error.messageKey ? { messageKey: error.messageKey, args: error.args } : undefined),
+      };
     }
-    return { ok: false, response: errorResponse(500, "WORKSPACE_INVALID", "无法检查工作区。") };
+    return { ok: false, response: errorResponse(500, "WORKSPACE_INVALID", "无法检查工作区。", { messageKey: "workspace.invalid" }) };
   }
 }

@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { authenticatedFetch } from "@/app/lib/auth/client";
 import { MAX_COMMAND_BYTES, MAX_HISTORY_DETAIL_BYTES, MAX_PATH_BYTES, MAX_TURN_DETAIL_BYTES, type Activity, type ActivityMetrics } from "@/app/lib/bridge/activity-types";
+import { useMessages } from "@/app/lib/i18n/context";
+import type { Messages } from "@/app/lib/i18n/messages";
 import IconTooltip from "./IconTooltip";
 
 type TurnPhase = "running" | "retrying" | "compacting" | "stopping" | "uncertain" | "done" | "stopped" | "failed";
@@ -15,7 +17,11 @@ type Message = {
   streaming?: boolean;
   phase?: TurnPhase;
   activities?: Activity[];
-  notice?: string;
+  // Stable message keys into `messages.agentPanel` — never the rendered text.
+  // `textKey` marks UI-generated bubbles (welcome, start-failure) so they
+  // re-render on locale switch; real user/agent content always uses `text`.
+  notice?: AgentPanelKey;
+  textKey?: AgentPanelKey;
   truncated?: boolean;
 };
 
@@ -28,19 +34,27 @@ type PiEvent =
       | { kind: "activity"; activity: Activity } };
 
 const isFinished = (phase: TurnPhase) => phase === "done" || phase === "stopped" || phase === "failed";
-const activityLabel = (name: string) => ({
-  read: "读取文件", write: "写入文件", edit: "修改文件", bash: "执行命令",
-  grep: "搜索内容", find: "查找文件", ls: "查看文件",
-} as Record<string, string>)[name] ?? "执行操作";
 
-function activityMetricsLabel(metrics?: ActivityMetrics): string {
+type AgentPanelKey = keyof Messages["agentPanel"];
+
+const ACTIVITY_NAME_KEYS = {
+  read: "activityNameRead", write: "activityNameWrite", edit: "activityNameEdit", bash: "activityNameBash",
+  grep: "activityNameGrep", find: "activityNameFind", ls: "activityNameLs",
+} as const satisfies Record<string, AgentPanelKey>;
+
+function activityLabel(m: Messages["agentPanel"], name: string): string {
+  const key = (ACTIVITY_NAME_KEYS as Record<string, AgentPanelKey>)[name] ?? "activityNameFallback";
+  return m[key] as string;
+}
+
+function activityMetricsLabel(m: Messages["agentPanel"], metrics?: ActivityMetrics): string {
   if (!metrics) return "";
   return [
-    metrics.offset !== undefined ? `从第 ${metrics.offset} 行开始` : "",
-    metrics.limit !== undefined ? `最多 ${metrics.limit} 行` : "",
-    metrics.editCount !== undefined ? `${metrics.editCount} 处修改` : "",
-    metrics.writeBytes !== undefined ? `${metrics.writeBytes.toLocaleString("en-US")} 字节` : "",
-    metrics.timeout !== undefined ? `超时 ${metrics.timeout} 秒` : "",
+    metrics.offset !== undefined ? m.activityMetricsOffset({ offset: String(metrics.offset) }) : "",
+    metrics.limit !== undefined ? m.activityMetricsLimit({ limit: String(metrics.limit) }) : "",
+    metrics.editCount !== undefined ? m.activityMetricsEditCount({ count: String(metrics.editCount) }) : "",
+    metrics.writeBytes !== undefined ? m.activityMetricsWriteBytes({ bytes: metrics.writeBytes.toLocaleString("en-US") }) : "",
+    metrics.timeout !== undefined ? m.activityMetricsTimeout({ seconds: String(metrics.timeout) }) : "",
   ].filter(Boolean).join(" · ");
 }
 
@@ -101,12 +115,25 @@ type ConnState = "connecting" | "open" | "closed" | "error";
 
 const ATTACHMENTS_DIR = ".attachments";
 
-function formatBytes(bytes: number): string {
+// Locale-neutral size parts; the surrounding sentence comes from the catalog.
+function formatBytesParts(bytes: number): { value: string; bytes: string } {
   const value = bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(2)} MiB` : `${(bytes / 1024).toFixed(2)} KiB`;
-  return `${value}（${bytes.toLocaleString("en-US")} 字节）`;
+  return { value, bytes: bytes.toLocaleString("en-US") };
 }
 
-async function uploadError(response: Response): Promise<string> {
+function formatBytes(m: Messages["agentPanel"], bytes: number): string {
+  return m.formatBytesDetail(formatBytesParts(bytes));
+}
+
+// Upload failures are either a stable catalog key (plus vars), a verbatim
+// server-provided message (API content, never re-localized), or a composite
+// of the localized size prefix plus a nested detail.
+type UploadErrorValue =
+  | { kind: "key"; key: AgentPanelKey; vars?: Record<string, string> }
+  | { kind: "text"; text: string }
+  | { kind: "sized"; size: string; detail: UploadErrorValue };
+
+async function uploadError(response: Response): Promise<UploadErrorValue> {
   let code: string | undefined;
   let message: string | undefined;
   if (response.headers.get("content-type")?.includes("application/json")) {
@@ -118,21 +145,32 @@ async function uploadError(response: Response): Promise<string> {
   }
   const knownCodes = ["FILE_TOO_LARGE", "WORKSPACE_TOTAL_TOO_LARGE", "WORKSPACE_FILE_COUNT_LIMIT", "WORKSPACE_INVALID", "INVALID_REQUEST", "INVALID_PATH", "PATH_IGNORED", "PATH_OUTSIDE_WORKSPACE", "PATH_UNSAFE", "PATH_IS_DIRECTORY", "WRITE_FAILED", "WORKSPACE_NOT_FOUND", "ORIGIN_MISMATCH"];
   if (typeof code === "string" && knownCodes.includes(code) && typeof message === "string") {
-    return `${message.slice(0, 300)}（${response.status}）`;
+    return { kind: "text", text: `${message.slice(0, 300)}（${response.status}）` };
   }
   if (response.status === 413) {
-    return "服务器或网关拒绝了请求（413），网关的大小限制可能低于应用配置，请联系管理员。";
+    return { kind: "key", key: "uploadGateway413" };
   }
-  if (response.status === 403) return "没有权限上传该文件（403）。";
-  if (response.status === 404) return "工作区不存在或无权访问（404）。";
-  return `服务器拒绝上传（${response.status}），请稍后重试。`;
+  if (response.status === 403) return { kind: "key", key: "uploadForbidden" };
+  if (response.status === 404) return { kind: "key", key: "uploadNotFound" };
+  return { kind: "key", key: "uploadRejected", vars: { status: String(response.status) } };
+}
+
+function renderUploadError(m: Messages["agentPanel"], error: UploadErrorValue): string {
+  if (error.kind === "text") return error.text;
+  if (error.kind === "sized") {
+    return `${m.attachmentSizePrefix({ size: error.size })}${renderUploadError(m, error.detail)}`;
+  }
+  const leaf = m[error.key];
+  // Keys are stored with the exact vars their template needs; the union of
+  // leaf signatures can't express that, so dispatch through a loose callable.
+  return typeof leaf === "function" ? (leaf as (vars: Record<string, string>) => string)(error.vars ?? {}) : leaf;
 }
 
 type PendingAttachment = {
   name: string;
   path: string;
   status: "uploading" | "ready" | "failed";
-  error?: string;
+  error?: UploadErrorValue;
 };
 
 type Activation = {
@@ -160,14 +198,18 @@ type Activation = {
 };
 
 const agentBase = (wid: string) => `/api/v1/workspaces/${encodeURIComponent(wid)}/agent`;
-const SEND_UNCERTAIN_NOTICE = "发送状态暂时未知，可尝试停止并等待连接恢复。";
-const STOP_UNCERTAIN_NOTICE = "停止请求未确认，请重试。";
-const HISTORY_UNCONFIRMED_NOTICE = "暂时无法核对本地回复与历史记录，当前内容已保留。";
-const SESSION_MISMATCH_NOTICE = "其他页面已切换会话；为避免丢失，当前回复仍保留。请复制需要的内容后刷新页面。";
+// Notices are stored as stable catalog keys so a locale switch re-renders them
+// without touching message state; rendered text never feeds back into logic.
+const SEND_UNCERTAIN_NOTICE: AgentPanelKey = "noticeSendUncertain";
+const STOP_UNCERTAIN_NOTICE: AgentPanelKey = "noticeStopUncertain";
+const HISTORY_UNCONFIRMED_NOTICE: AgentPanelKey = "noticeHistoryUnconfirmed";
+const SESSION_MISMATCH_NOTICE: AgentPanelKey = "noticeSessionMismatch";
+const WELCOME_ID = 0;
 const welcome: Message = {
-  id: 0,
+  id: WELCOME_ID,
   role: "agent",
-  text: "你好！我是随心一码 AI 编程助手。告诉我你想做什么应用，我会帮你编写代码，并在右侧 WebContainer 中实时预览。",
+  text: "",
+  textKey: "welcome",
 };
 
 type AgentPanelProps = { workspaceId: string | null; maxFileBytes?: number | null };
@@ -177,6 +219,9 @@ export default function AgentPanel(props: AgentPanelProps) {
 }
 
 function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps) {
+  const i18n = useMessages();
+  // `ap` = agentPanel catalog. (Message-map callbacks shadow `m` below.)
+  const ap = i18n.agentPanel;
   const [messages, setMessages] = useState<Message[]>([welcome]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -192,7 +237,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
   const [sessionActionPending, setSessionActionPending] = useState(false);
   const [sessionUncertain, setSessionUncertain] = useState(false);
   const [sessionMismatch, setSessionMismatch] = useState(false);
-  const [sessionNotice, setSessionNotice] = useState("");
+  // Stable catalog key ("" = none) so locale switches re-render the notice.
+  const [sessionNotice, setSessionNotice] = useState<"" | AgentPanelKey>("");
   const [activityOpen, setActivityOpen] = useState<Record<string, boolean>>({});
   const [historyActivityTruncated, setHistoryActivityTruncated] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
@@ -358,7 +404,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
         });
         if (!current()) return;
         if (!res.ok) {
-          throw new Error(`编程助手启动失败（${res.status}）`);
+          // Internal-only error (logged, never rendered); keep it locale-neutral.
+          throw new Error(`agent start failed (${res.status})`);
         }
         // Subscribe to the agent's SSE event stream.
         const sse = new EventSource(`${agentBase(wid)}/events?clientId=${encodeURIComponent(lease.clientId)}`);
@@ -530,7 +577,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           {
             id: idRef.current++,
             role: "agent",
-            text: "无法启动编程助手，请稍后重试；若问题持续，请联系管理员检查服务配置。",
+            text: "",
+            textKey: "errorStartFailed",
           },
         ]);
       }
@@ -586,7 +634,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       if (maxFileBytes !== null && file.size > maxFileBytes) {
         setAttachments((prev) => [...prev, {
           name: file.name, path: attachmentPath, status: "failed",
-          error: `文件大小为 ${formatBytes(file.size)}，超过单个文件上限 ${formatBytes(maxFileBytes)}。`,
+          error: { kind: "key", key: "attachmentTooLarge", vars: { actual: formatBytes(ap, file.size), limit: formatBytes(ap, maxFileBytes) } },
         }]);
         continue;
       }
@@ -598,13 +646,14 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: file },
         );
         if (!res.ok) {
-          const error = `文件大小：${formatBytes(file.size)}。${await uploadError(res)}`;
+          const detail = await uploadError(res);
+          const error: UploadErrorValue = { kind: "sized", size: formatBytes(ap, file.size), detail };
           setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "failed", error } : a)));
         } else {
           setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "ready" } : a)));
         }
       } catch {
-        setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "failed", error: "网络连接失败，请检查网络或登录状态后重试。" } : a)));
+        setAttachments((prev) => prev.map((a) => (a.path === attachmentPath ? { ...a, status: "failed", error: { kind: "key", key: "attachmentNetworkError" } } : a)));
       }
     }
   }
@@ -660,7 +709,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           : m));
       } else if (!res.ok && !lease.released && activeRef.current === lease && lease.turnId === turnId) {
         setMessages((prev) => prev.map((m) => m.id === agentMsg.id
-          ? { ...m, streaming: false, phase: "failed", notice: res.status === 409 ? "会话已变化或其他页面正在处理，请稍后再试。" : "消息发送失败，请稍后重试。" }
+          ? { ...m, streaming: false, phase: "failed", notice: res.status === 409 ? "noticeSendConflict" : "noticeSendFailed" }
           : m));
         restoreDraft(lease);
         setBusy(false);
@@ -684,9 +733,9 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
     if (!lease || lease.released || !lease.ready || !lease.historyReady || !lease.revision ||
         lease.serverBusy || lease.sessionActionPending || sessionMismatchRef.current || lease.turnId !== null || !sessionSupported || sessionUncertain ||
         (action === "restore" && !canRestore)) return;
-    if (unconfirmedTurnRef.current && !window.confirm("当前回复尚未与历史记录核对，切换会清除页面中的这条回复。是否继续？")) return;
+    if (unconfirmedTurnRef.current && !window.confirm(ap.confirmDiscardUnconfirmed)) return;
     const confirmMigration = action === "restore" && restoreNeedsMigration;
-    if (confirmMigration && !window.confirm("此会话使用旧格式，Pi 恢复时可能改写原文件。请先备份，确认继续？")) return;
+    if (confirmMigration && !window.confirm(ap.confirmMigration)) return;
     lease.sessionActionPending = true;
     lease.sessionActionRevision = lease.revision;
     setSessionActionPending(true);
@@ -704,21 +753,21 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       if (!res.ok) {
         lease.sessionActionRevision = null;
         const code = body?.error?.code;
-        if (code === "SESSION_NOT_SAVED") setSessionNotice("当前会话有未保存的消息，暂时无法切换。");
-        else if (code === "SESSION_EXPIRED") { setCanRestore(false); setSessionNotice("没有可恢复的 24 小时内会话。"); }
-        else if (code === "SESSION_CHANGED" || code === "AGENT_BUSY") setSessionNotice("会话状态已变化，请稍后重试。");
-        else setSessionNotice("无法切换会话，请稍后重试。");
+        if (code === "SESSION_NOT_SAVED") setSessionNotice("noticeSessionNotSaved");
+        else if (code === "SESSION_EXPIRED") { setCanRestore(false); setSessionNotice("noticeSessionExpired"); }
+        else if (code === "SESSION_CHANGED" || code === "AGENT_BUSY") setSessionNotice("noticeSessionChanged");
+        else setSessionNotice("noticeSessionSwitchFailed");
         if (res.status >= 500) { lease.historyReady = false; setSessionUncertain(true); }
       } else if (body.cancelled === true) {
         lease.sessionActionRevision = null;
-        setSessionNotice("会话切换已取消。");
+        setSessionNotice("noticeSessionCancelled");
       }
     } catch {
       lease.sessionActionRevision = null;
       if (!lease.released && activeRef.current === lease) {
         lease.historyReady = false;
         setSessionUncertain(true);
-        setSessionNotice("切换状态未确认，请关闭所有工作区页面后重新打开。");
+        setSessionNotice("noticeSessionUnconfirmedSwitch");
       }
     } finally {
       lease.sessionActionPending = false;
@@ -753,11 +802,11 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
   }
 
   const turnUnconfirmed = messages.some((message) => message.streaming && (message.notice === SEND_UNCERTAIN_NOTICE || message.notice === STOP_UNCERTAIN_NOTICE));
-  const workingLabel = phase === "uncertain" ? "任务状态未确认" : stopping ? "正在停止" : turnUnconfirmed ? "任务状态未确认" : phase === "retrying" ? "正在重试" : phase === "compacting" ? "正在整理上下文" : "正在处理";
+  const workingLabel = phase === "uncertain" ? ap.statusUncertainTask : stopping ? ap.statusStopping : turnUnconfirmed ? ap.statusUncertainTask : phase === "retrying" ? ap.statusRetrying : phase === "compacting" ? ap.statusCompacting : ap.statusWorking;
   const statusLabel =
-    conn === "open" ? (sessionMismatch ? "会话已切换" : sessionUncertain ? "会话状态未确认" : sessionSwitching || sessionActionPending ? "正在切换会话" : busy ? workingLabel : otherBusy ? "其他页面正在处理" : historyState === "error" ? "会话恢复失败" : historyState === "loading" ? "正在恢复会话" : "等待输入") :
-    conn === "connecting" ? "正在连接" :
-    conn === "error" ? "连接失败" : "已断开连接";
+    conn === "open" ? (sessionMismatch ? ap.statusSessionSwitched : sessionUncertain ? ap.statusSessionUncertain : sessionSwitching || sessionActionPending ? ap.statusSessionSwitching : busy ? workingLabel : otherBusy ? ap.statusOtherBusy : historyState === "error" ? ap.statusHistoryError : historyState === "loading" ? ap.statusHistoryLoading : ap.statusIdle) :
+    conn === "connecting" ? ap.statusConnecting :
+    conn === "error" ? ap.statusConnError : ap.statusClosed;
   const dotColor =
     conn === "open" ? (busy ? "bg-amber-500 animate-pulse motion-reduce:animate-none" : "bg-[#799b39]") :
     conn === "connecting" ? "bg-amber-500 animate-pulse motion-reduce:animate-none" : "bg-neutral-400";
@@ -769,22 +818,22 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
       {/* Panel header */}
       <div className="flex min-h-14 shrink-0 items-center justify-between gap-2 border-b border-[var(--brand-line)] bg-[var(--brand-paper)] px-4">
         <span className="flex shrink-0 items-center gap-2 whitespace-nowrap text-sm font-bold text-[var(--brand-ink)]">
-          <span className="grid h-7 w-7 place-items-center rounded-md bg-[var(--brand-lime)] text-base" aria-hidden="true">✳</span>AI 编程助手
+          <span className="grid h-7 w-7 place-items-center rounded-md bg-[var(--brand-lime)] text-base" aria-hidden="true">✳</span>{ap.title}
         </span>
         <div className="flex min-w-0 items-center gap-1.5">
           <span role="status" aria-live="polite" title={statusLabel} className="flex min-w-0 items-center gap-1.5 rounded-full border border-[#dce3d3] bg-white px-2.5 py-1 text-xs text-[var(--brand-muted)]">
             <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotColor}`} />
             <span className="truncate">{statusLabel}</span>
           </span>
-          <IconTooltip label="新建会话">
-            <button type="button" aria-label="新建会话" onClick={() => void changeSession("new")}
+          <IconTooltip label={ap.actionNewSession}>
+            <button type="button" aria-label={ap.actionNewSession} onClick={() => void changeSession("new")}
               disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || sessionSwitching || sessionActionPending || sessionUncertain || sessionMismatch || busy || otherBusy}
               className="flex h-10 w-10 items-center justify-center rounded-md text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:pointer-events-none disabled:opacity-40">
               <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
             </button>
           </IconTooltip>
-          <IconTooltip label="恢复上次会话：仅限 24 小时内；更长内容依赖内置记忆。">
-            <button type="button" aria-label="恢复上次会话" onClick={() => void changeSession("restore")}
+          <IconTooltip label={ap.actionRestoreSessionHint}>
+            <button type="button" aria-label={ap.actionRestoreSession} onClick={() => void changeSession("restore")}
               disabled={conn !== "open" || historyState !== "ready" || !sessionSupported || !canRestore || sessionSwitching || sessionActionPending || sessionUncertain || sessionMismatch || busy || otherBusy}
               className="flex h-10 w-10 items-center justify-center rounded-md text-[var(--brand-ink)] hover:bg-[#eff5d9] disabled:pointer-events-none disabled:opacity-40">
               <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l3 2" /></svg>
@@ -802,10 +851,10 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
         }}
         className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-5"
       >
-        {sessionUncertain && <p role="alert" className="text-sm text-red-600">会话状态未确认，请关闭所有工作区页面后重新打开。</p>}
-        {sessionNotice && <p role="alert" className="text-sm text-red-600">{sessionNotice}</p>}
-        {historyState === "error" && <p role="alert" className="text-sm text-red-600">无法恢复最近会话，请刷新页面重试。</p>}
-        {historyActivityTruncated && <p className="text-xs text-[var(--brand-muted)]">部分操作详情已省略。</p>}
+        {sessionUncertain && <p role="alert" className="text-sm text-red-600">{ap.alertSessionUncertain}</p>}
+        {sessionNotice && <p role="alert" className="text-sm text-red-600">{ap[sessionNotice] as string}</p>}
+        {historyState === "error" && <p role="alert" className="text-sm text-red-600">{ap.alertHistoryError}</p>}
+        {historyActivityTruncated && <p className="text-xs text-[var(--brand-muted)]">{ap.alertHistoryTruncated}</p>}
         {messages.map((m) => {
           const key = activityKey(m);
           const expanded = activityOpen[key] ?? (m.id === latestAssistantId);
@@ -820,13 +869,13 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
                   : "rounded-bl-sm border border-[#e1e6d8] bg-[#f5f8ed] text-[#3d4637]"
               }`}
             >
-              {m.text}
+              {m.textKey ? ap[m.textKey] as string : m.text}
               {m.streaming && m.text && (
                 <span aria-hidden="true" className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-neutral-400 align-text-bottom motion-reduce:animate-none" />
               )}
               {m.streaming && !m.text && (
                 <div className="text-[var(--brand-muted)]">
-                  {m.phase === "stopping" ? "正在停止…" : m.phase === "uncertain" || m.notice === SEND_UNCERTAIN_NOTICE || m.notice === STOP_UNCERTAIN_NOTICE ? "任务状态未确认" : m.phase === "retrying" ? "正在重试…" : m.phase === "compacting" ? "正在整理上下文…" : "正在处理…"}
+                  {m.phase === "stopping" ? ap.streamStopping : m.phase === "uncertain" || m.notice === SEND_UNCERTAIN_NOTICE || m.notice === STOP_UNCERTAIN_NOTICE ? ap.streamUncertain : m.phase === "retrying" ? ap.streamRetrying : m.phase === "compacting" ? ap.streamCompacting : ap.streamWorking}
                 </div>
               )}
               {!!m.activities?.length && (
@@ -834,31 +883,31 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
                   <button type="button" aria-expanded={expanded} aria-controls={`activity-${m.id}`}
                     onClick={() => setActivityOpen((previous) => ({ ...previous, [key]: !expanded }))}
                     className="flex items-center gap-1 rounded text-left font-medium hover:text-[var(--brand-ink)]">
-                    <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>操作详情（{m.activities.length}）
+                    <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>{ap.activityToggle({ count: String(m.activities.length) })}
                   </button>
-                  <section id={`activity-${m.id}`} hidden={!expanded} className="mt-1 space-y-1" aria-label="操作详情">
+                  <section id={`activity-${m.id}`} hidden={!expanded} className="mt-1 space-y-1" aria-label={ap.activityRegion}>
                     {m.activities.map((activity) => {
                       const status = activity.status === "running" && m.phase === "uncertain" ? "unknown" : activity.status;
-                      const metrics = activityMetricsLabel(activity.metrics);
+                      const metrics = activityMetricsLabel(ap, activity.metrics);
                       return <div key={activity.id} className="flex items-start gap-1.5">
                         <span aria-hidden="true">{status === "running" ? "◌" : status === "failed" ? "!" : status === "unknown" ? "?" : "✓"}</span>
                         <div className="min-w-0 flex-1">
-                          <div className="break-all">{activityLabel(activity.name)}{activity.detail?.kind === "path" ? ` · ${activity.detail.value}` : ""} · {status === "running" ? "进行中" : status === "failed" ? "失败" : status === "unknown" ? "状态未确认" : "已完成"}</div>
+                          <div className="break-all">{activityLabel(ap, activity.name)}{activity.detail?.kind === "path" ? ` · ${activity.detail.value}` : ""} · {status === "running" ? ap.activityStatusRunning : status === "failed" ? ap.activityStatusFailed : status === "unknown" ? ap.activityStatusUnknown : ap.activityStatusDone}</div>
                           {metrics && <div className="mt-0.5 text-[var(--brand-muted)]">{metrics}</div>}
                           {activity.detail?.kind === "command" && <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-white px-2 py-1 font-mono text-[var(--brand-ink)]">{activity.detail.value}</pre>}
-                          {(activity.detailTruncated || activity.detail?.truncated) && <div className="mt-0.5">详情过长，部分已省略。</div>}
-                          {activity.detail?.escaped && <div className="mt-0.5">不可见控制字符已转义。</div>}
+                          {(activity.detailTruncated || activity.detail?.truncated) && <div className="mt-0.5">{ap.activityDetailTruncated}</div>}
+                          {activity.detail?.escaped && <div className="mt-0.5">{ap.activityDetailEscaped}</div>}
                         </div>
                       </div>;
                     })}
                   </section>
                 </div>
               )}
-              {m.phase === "uncertain" && <p className="mt-2 text-xs text-red-600">暂时无法确认任务状态。请关闭所有工作区页面后重新打开。</p>}
-              {m.phase === "stopped" && <p className="mt-2 text-xs text-neutral-500">已停止。已执行的文件改动不会撤销。</p>}
-              {m.phase === "failed" && !m.notice && <p className="mt-2 text-xs text-red-600">本次处理未完成，请重试。</p>}
-              {m.truncated && <p className="mt-2 text-xs text-neutral-500">内容较长，部分内容已省略。</p>}
-              {m.notice && <p className="mt-2 text-xs text-red-600">{m.notice}</p>}
+              {m.phase === "uncertain" && <p className="mt-2 text-xs text-red-600">{ap.alertTurnUncertain}</p>}
+              {m.phase === "stopped" && <p className="mt-2 text-xs text-neutral-500">{ap.alertTurnStopped}</p>}
+              {m.phase === "failed" && !m.notice && <p className="mt-2 text-xs text-red-600">{ap.alertTurnFailed}</p>}
+              {m.truncated && <p className="mt-2 text-xs text-neutral-500">{ap.alertTurnTruncated}</p>}
+              {m.notice && <p className="mt-2 text-xs text-red-600">{ap[m.notice] as string}</p>}
             </div>
           </div>;
         })}
@@ -902,12 +951,12 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
                 </svg>
                 <span className="min-w-0 break-all">
                   {a.name}
-                  {a.status === "uploading" ? " · 上传中…" : a.status === "failed" ? <span role="alert"> · 上传失败：{a.error}</span> : ""}
+                  {a.status === "uploading" ? ` · ${ap.attachmentUploading}` : a.status === "failed" && a.error ? <span role="alert"> · {ap.attachmentFailedPrefix}{renderUploadError(ap, a.error)}</span> : ""}
                 </span>
                 <button
                   type="button"
                   onClick={() => removeAttachment(a.path)}
-                  aria-label={`移除附件 ${a.name}`}
+                  aria-label={ap.attachmentRemove({ name: a.name })}
                   className="shrink-0 rounded-full p-0.5 text-current opacity-60 hover:opacity-100"
                 >
                   <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -934,8 +983,8 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
             type="button"
             onClick={() => fileInputRef.current?.click()}
             disabled={conn !== "open"}
-            aria-label="上传附件到工作区"
-            title="上传附件到工作区"
+            aria-label={ap.actionUpload}
+            title={ap.actionUpload}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded text-neutral-500 hover:bg-neutral-100 hover:text-neutral-700 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" width="18" height="18">
@@ -951,28 +1000,28 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
                 void send();
               }
             }}
-            aria-label="发送给 AI 编程助手的消息"
+            aria-label={ap.inputAriaLabel}
             rows={2}
-            placeholder={conn !== "open" ? (conn === "error" ? "连接失败，请刷新页面重试。" : "正在连接编程助手…") : sessionMismatch ? "会话已切换，请刷新页面。" : busy ? "请等待助手回复…" : otherBusy ? "其他页面正在处理…" : "描述你想实现的应用或功能…"}
+            placeholder={conn !== "open" ? (conn === "error" ? ap.placeholderConnError : ap.placeholderConnecting) : sessionMismatch ? ap.placeholderSessionMismatch : busy ? ap.placeholderBusy : otherBusy ? ap.placeholderOtherBusy : ap.placeholderIdle}
             disabled={conn !== "open" || busy || otherBusy || sessionMismatch}
             className="min-w-0 flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-neutral-800 outline-none placeholder:text-neutral-400 disabled:cursor-not-allowed disabled:text-neutral-400"
           />
-          <IconTooltip placement="top" label={phase === "uncertain" && busy ? "状态未确认，无法停止" : stopping ? "正在停止" : "停止生成"}>
+          <IconTooltip placement="top" label={phase === "uncertain" && busy ? ap.actionStopUncertain : stopping ? ap.statusStopping : ap.actionStop}>
             <button
               type="button"
               onClick={() => void stop()}
               disabled={!busy || stopping || phase === "uncertain"}
-              aria-label="停止生成"
+              aria-label={ap.actionStop}
               aria-busy={stopping}
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-red-600 hover:bg-red-50 disabled:pointer-events-none disabled:opacity-40"
             >
               <svg viewBox="0 0 24 24" fill="currentColor" className="h-4 w-4" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1" /></svg>
             </button>
           </IconTooltip>
-          <IconTooltip placement="top" label="发送消息">
+          <IconTooltip placement="top" label={ap.actionSend}>
             <button
               type="submit"
-              aria-label="发送消息"
+              aria-label={ap.actionSend}
               disabled={busy || otherBusy || sessionSwitching || sessionActionPending || sessionUncertain || sessionMismatch || historyState !== "ready" || !input.trim() || conn !== "open" || attachments.some((a) => a.status !== "ready")}
               className="brand-button h-9 w-9 shrink-0 p-0 disabled:pointer-events-none"
             >
@@ -981,7 +1030,7 @@ function AgentPanelContent({ workspaceId, maxFileBytes = null }: AgentPanelProps
           </IconTooltip>
         </div>
         <p className="mt-1.5 px-0.5 text-[13px] text-neutral-400">
-          Enter 发送 · Shift+Enter 换行 · 附件保存到工作区 .attachments/{maxFileBytes !== null ? ` · 单个文件上限 ${formatBytes(maxFileBytes)}` : ""}
+          {ap.inputHint}{maxFileBytes !== null ? ap.inputHintFileLimit({ limit: formatBytes(ap, maxFileBytes) }) : ""}
         </p>
       </form>
     </div>

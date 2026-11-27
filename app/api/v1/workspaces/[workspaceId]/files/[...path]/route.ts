@@ -45,24 +45,30 @@ export async function PUT(request: Request, { params }: Context) {
     try {
       bytes = await readBytes(request, maxBytes);
     } catch {
-      return errorResponse(400, "INVALID_REQUEST", "无法读取上传的文件。");
+      return errorResponse(400, "INVALID_REQUEST", "无法读取上传的文件。", { messageKey: "request.uploadUnreadable" });
     }
     if (bytes === null) {
-      return errorResponse(413, "FILE_TOO_LARGE", `文件内容超过 ${maxBytes} 字节的大小限制。`);
+      return errorResponse(413, "FILE_TOO_LARGE", `文件内容超过 ${maxBytes} 字节的大小限制。`, {
+        messageKey: "file.tooLarge",
+        args: { maxBytes },
+      });
     }
     contents = bytes;
   } else {
     try {
       const body = await request.json();
       if (typeof body?.contents !== "string") {
-        return errorResponse(400, "INVALID_REQUEST", "请求正文必须包含字符串类型的 contents 字段。");
+        return errorResponse(400, "INVALID_REQUEST", "请求正文必须包含字符串类型的 contents 字段。", { messageKey: "request.contentsRequired" });
       }
       contents = body.contents;
     } catch {
-      return errorResponse(400, "INVALID_REQUEST", "请求正文必须是有效的 JSON。");
+      return errorResponse(400, "INVALID_REQUEST", "请求正文必须是有效的 JSON。", { messageKey: "request.invalidJson" });
     }
     if (Buffer.byteLength(contents, "utf8") > maxBytes) {
-      return errorResponse(413, "FILE_TOO_LARGE", `文件内容超过 ${maxBytes} 字节的大小限制。`);
+      return errorResponse(413, "FILE_TOO_LARGE", `文件内容超过 ${maxBytes} 字节的大小限制。`, {
+        messageKey: "file.tooLarge",
+        args: { maxBytes },
+      });
     }
   }
 
@@ -72,9 +78,10 @@ export async function PUT(request: Request, { params }: Context) {
       resolved = await resolveSafeFilePath(workspace.rootPath, segments);
     } catch (error) {
       if (error instanceof WorkspacePathError) {
-        return errorResponse(400, error.code, error.message);
+        return errorResponse(400, error.code, error.message,
+          error.messageKey ? { messageKey: error.messageKey, args: error.args } : undefined);
       }
-      return errorResponse(500, "INVALID_PATH", "无法解析文件路径。");
+      return errorResponse(500, "INVALID_PATH", "无法解析文件路径。", { messageKey: "file.pathUnresolvable" });
     }
 
     if (segments[0] === ".attachments") {
@@ -86,14 +93,23 @@ export async function PUT(request: Request, { params }: Context) {
         });
         const size = typeof contents === "string" ? Buffer.byteLength(contents, "utf8") : contents.byteLength;
         if (tree.sizeBytes - (existing?.size ?? 0) + size > limits.maxTotalBytes) {
-          return errorResponse(413, "WORKSPACE_TOTAL_TOO_LARGE", `上传后工作区总大小将超过 ${limits.maxTotalBytes} 字节的上限。`);
+          return errorResponse(413, "WORKSPACE_TOTAL_TOO_LARGE", `上传后工作区总大小将超过 ${limits.maxTotalBytes} 字节的上限。`, {
+            messageKey: "file.workspaceTotalTooLarge",
+            args: { maxTotalBytes: limits.maxTotalBytes },
+          });
         }
         if (!existing && tree.fileCount >= limits.maxFiles) {
-          return errorResponse(413, "WORKSPACE_FILE_COUNT_LIMIT", `工作区文件数量已达到 ${limits.maxFiles} 的上限。`);
+          return errorResponse(413, "WORKSPACE_FILE_COUNT_LIMIT", `工作区文件数量已达到 ${limits.maxFiles} 的上限。`, {
+            messageKey: "file.workspaceFileCountLimit",
+            args: { maxFiles: limits.maxFiles },
+          });
         }
       } catch (error) {
-        if (error instanceof WorkspaceTreeError) return errorResponse(422, error.code, error.message);
-        return errorResponse(500, "WRITE_FAILED", "无法检查工作区大小。");
+        if (error instanceof WorkspaceTreeError) {
+          return errorResponse(422, error.code, error.message,
+            error.messageKey ? { messageKey: error.messageKey, args: error.args } : undefined);
+        }
+        return errorResponse(500, "WRITE_FAILED", "无法检查工作区大小。", { messageKey: "file.workspaceSizeCheckFailed" });
       }
     }
 
@@ -101,7 +117,7 @@ export async function PUT(request: Request, { params }: Context) {
       await fs.mkdir(path.dirname(resolved), { recursive: true });
       await fs.writeFile(resolved, contents);
     } catch {
-      return errorResponse(500, "WRITE_FAILED", "无法写入文件。");
+      return errorResponse(500, "WRITE_FAILED", "无法写入文件。", { messageKey: "file.writeFailed" });
     }
 
     const relative = path.relative(workspace.rootPath, resolved);
